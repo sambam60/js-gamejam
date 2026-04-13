@@ -1751,24 +1751,95 @@
       }
     }
 
-    // portals (Portal 2 blue/orange)
+    // portals — Portal 2 style rectangular, pixelated
     for (let i = 0; i < state.portals.length; i++) {
       const pt = state.portals[i];
       const ptx = pt.x - cam, pty = H - pt.y;
       const col = i === 0 ? '#3399ff' : '#ff8c1a';
+      const colBright = i === 0 ? '#66bbff' : '#ffaa44';
       const colInner = i === 0 ? '#1a6dd6' : '#cc6600';
-      const glow = i === 0 ? 'rgba(51,153,255,0.45)' : 'rgba(255,140,26,0.45)';
+      const colDark = i === 0 ? '#0a2244' : '#331a00';
+      const colVoid = i === 0 ? '#050e1a' : '#1a0d00';
+      const glow = i === 0 ? 'rgba(51,153,255,0.5)' : 'rgba(255,140,26,0.5)';
       const pulse = 0.7 + Math.sin(frameTick * 0.08 + i * 3) * 0.3;
+
+      const PW = 12, PH = 48;
+      const px = Math.floor(ptx - PW / 2), py = Math.floor(pty - PH / 2);
+
       ctx.save();
-      ctx.shadowColor = glow; ctx.shadowBlur = 18;
-      ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.globalAlpha = pulse;
-      ctx.beginPath(); ctx.arc(ptx, pty, 14, 0, Math.PI * 2); ctx.stroke();
-      ctx.strokeStyle = colInner; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.arc(ptx, pty, 7, 0, Math.PI * 2); ctx.stroke();
+
+      // ambient glow behind portal
+      ctx.shadowColor = glow; ctx.shadowBlur = 24 * pulse;
+      ctx.fillStyle = colDark; ctx.globalAlpha = 0.6 * pulse;
+      ctx.fillRect(px - 3, py - 3, PW + 6, PH + 6);
+      ctx.shadowBlur = 0;
+
+      // inner void
+      ctx.fillStyle = colVoid; ctx.globalAlpha = 0.95;
+      ctx.fillRect(px + 2, py + 2, PW - 4, PH - 4);
+
+      // scrolling energy bands inside the portal
+      for (let sy = 0; sy < PH - 4; sy += 2) {
+        const bandPhase = (frameTick * 0.12 + sy * 0.5 + i * 50) % (PH + 8);
+        const bandAlpha = Math.sin(bandPhase / PH * Math.PI) * 0.35 * pulse;
+        if (bandAlpha > 0.02) {
+          ctx.fillStyle = colInner; ctx.globalAlpha = bandAlpha;
+          ctx.fillRect(px + 2, py + 2 + sy, PW - 4, 2);
+        }
+      }
+
+      // bright horizontal streaks (pixelated energy)
+      for (let k = 0; k < 3; k++) {
+        const streakY = ((frameTick * 0.8 + k * 17 + i * 40) % (PH - 8)) + 4;
+        ctx.fillStyle = colBright; ctx.globalAlpha = 0.4 * pulse;
+        ctx.fillRect(px + 3, py + Math.floor(streakY), PW - 6, 1);
+      }
+
+      // outer frame — bright border
+      ctx.globalAlpha = pulse;
+      ctx.strokeStyle = col; ctx.lineWidth = 2;
+      ctx.strokeRect(px, py, PW, PH);
+
+      // inner frame — slightly inset
+      ctx.strokeStyle = colInner; ctx.lineWidth = 1; ctx.globalAlpha = 0.7 * pulse;
+      ctx.strokeRect(px + 1, py + 1, PW - 2, PH - 2);
+
+      // corner highlights (brighter pixels at corners, Portal 2 style)
+      ctx.fillStyle = colBright; ctx.globalAlpha = pulse * 0.9;
+      ctx.fillRect(px - 1, py - 1, 3, 3);
+      ctx.fillRect(px + PW - 2, py - 1, 3, 3);
+      ctx.fillRect(px - 1, py + PH - 2, 3, 3);
+      ctx.fillRect(px + PW - 2, py + PH - 2, 3, 3);
+
+      // floating pixel particles along the edges
+      for (let p = 0; p < 8; p++) {
+        const t = ((frameTick * 0.025 + p / 8 + i * 0.5) % 1);
+        const edgeY = py + t * PH;
+        const side = (p % 2 === 0) ? -1 : 1;
+        const drift = Math.sin(frameTick * 0.06 + p * 1.7) * 6;
+        const edgeX = ptx + side * (PW / 2 + 2 + Math.abs(drift));
+        const pAlpha = Math.sin(t * Math.PI) * pulse * 0.7;
+        ctx.fillStyle = col; ctx.globalAlpha = pAlpha;
+        ctx.fillRect(Math.floor(edgeX) - 1, Math.floor(edgeY) - 1, 2, 2);
+      }
+
+      // top/bottom edge particles
+      for (let p = 0; p < 4; p++) {
+        const t = ((frameTick * 0.03 + p / 4 + i * 0.3) % 1);
+        const edgeX = px + 2 + t * (PW - 4);
+        const topBot = (p % 2 === 0) ? -1 : 1;
+        const drift = Math.sin(frameTick * 0.07 + p * 2.3) * 5;
+        const edgeY = pty + topBot * (PH / 2 + 2 + Math.abs(drift));
+        const pAlpha = Math.sin(t * Math.PI) * pulse * 0.5;
+        ctx.fillStyle = col; ctx.globalAlpha = pAlpha;
+        ctx.fillRect(Math.floor(edgeX) - 1, Math.floor(edgeY) - 1, 2, 2);
+      }
+
       ctx.restore();
-      // Label
+
+      // label
       ctx.fillStyle = col; ctx.font = '8px ' + FONT_MONO; ctx.textAlign = 'center';
-      ctx.fillText(i === 0 ? 'A' : 'B', ptx, pty - 20); ctx.textAlign = 'left';
+      ctx.fillText(i === 0 ? 'A' : 'B', ptx, py - 6); ctx.textAlign = 'left';
     }
 
     // coins
