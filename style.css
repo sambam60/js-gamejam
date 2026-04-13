@@ -1,0 +1,272 @@
+@font-face {
+  font-family: 'Redaction 35';
+  src: url('public/fonts/redaction-35-latin-400-normal.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+}
+@font-face {
+  font-family: 'Redaction 35';
+  src: url('public/fonts/redaction-35-latin-700-normal.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+}
+@font-face {
+  font-family: 'Redaction 35';
+  src: url('public/fonts/redaction-35-latin-400-italic.ttf') format('truetype');
+  font-weight: 400;
+  font-style: italic;
+}
+@font-face {
+  font-family: 'Redaction 35';
+  src: url('public/fonts/redaction-35-latin-700-italic.ttf') format('truetype');
+  font-weight: 700;
+  font-style: italic;
+}
+@font-face {
+  font-family: 'Berkeley Mono';
+  src: url('public/fonts/Berkeley Mono Variable.ttf') format('truetype');
+  font-weight: 100 900;
+  font-style: normal;
+}
+
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: #000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  min-height: 100vh;
+  min-height: 100dvh;
+  min-height: -webkit-fill-available;
+  font-family: 'Berkeley Mono', 'Courier New', 'Consolas', monospace;
+  overflow: hidden;
+  color: #00cc00;
+  -webkit-font-smoothing: none;
+  -moz-osx-font-smoothing: auto;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+#game-wrapper {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  padding: max(8px, env(safe-area-inset-top, 0px)) max(8px, env(safe-area-inset-right, 0px)) 0 max(8px, env(safe-area-inset-left, 0px));
+  gap: 6px;
+  height: 100vh;
+  height: 100dvh;
+  max-height: -webkit-fill-available;
+  box-sizing: border-box;
+}
+
+#canvas-container {
+  position: relative;
+  width: 100%;
+  flex: 1;
+  min-height: 120px;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  cursor: crosshair;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+  border: 1px solid #006600;
+  border-radius: 0;
+}
+
+#scanlines {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0,0,0,0.04) 2px,
+    rgba(0,0,0,0.04) 4px
+  );
+}
+
+#vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse at center,
+    transparent 60%,
+    rgba(0,0,0,0.4) 100%
+  );
+}
+
+#hotbar {
+  display: none;
+  align-self: flex-start;
+  gap: 2px;
+  padding: 4px 0 2px 0;
+  flex-shrink: 0;
+}
+
+#hotbar:not(:empty) {
+  display: flex;
+  min-height: 42px;
+}
+
+#hotbar .slot {
+  width: 36px;
+  height: 36px;
+  border: 1px solid #003300;
+  background: #0d0d0d;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+#hotbar .slot.selected {
+  border-color: #33ff33;
+  background: #001a00;
+  box-shadow: 0 0 6px rgba(51,255,51,0.15);
+}
+
+#hotbar .slot .slot-num {
+  position: absolute;
+  top: 1px;
+  left: 3px;
+  font-size: 8px;
+  line-height: 1;
+  color: #003300;
+}
+
+#hotbar .slot.selected .slot-num {
+  color: #33ff33;
+}
+
+#hotbar .slot .slot-icon {
+  font-size: 15px;
+  color: #009900;
+  line-height: 1;
+}
+
+#hotbar .slot.selected .slot-icon {
+  color: #33ff33;
+}
+
+#hotbar .slot .slot-cd {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  height: 0;
+  width: 100%;
+  background: rgba(0,0,0,0.5);
+  pointer-events: none;
+}
+
+#hotbar .slot-label {
+  font-size: 8px;
+  color: #009900;
+  letter-spacing: 0.08em;
+  align-self: flex-start;
+  padding-left: 2px;
+  line-height: 36px;
+  white-space: nowrap;
+}
+
+#mobile-controls {
+  display: none;
+  justify-content: space-between;
+  width: 100%;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+#mobile-controls button {
+  flex: 1;
+  min-height: 48px;
+  padding: 14px 8px;
+  font-size: 14px;
+  font-family: 'Berkeley Mono', 'Courier New', monospace;
+  background: transparent;
+  color: #00cc00;
+  border: 1px solid #006600;
+  border-radius: 0;
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#mobile-controls button:active {
+  background: #001a00;
+  color: #33ff33;
+  border-color: #00cc00;
+  text-shadow: 0 0 8px rgba(51,255,51,0.35);
+  box-shadow: 0 0 8px rgba(51,255,51,0.15);
+}
+
+/*
+ * --browser-chrome-bottom is set by JS via visualViewport; it measures the
+ * actual gap caused by Safari's tab bar / toolbar.
+ */
+@media (pointer: coarse), (max-width: 600px) {
+  #game-wrapper:not(.game-playing) {
+    padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
+  }
+
+  #game-wrapper:not(.game-playing) #canvas-container {
+    max-height: calc(100dvh - 48px - env(safe-area-inset-bottom, 0px));
+    max-height: calc(100vh - 48px - env(safe-area-inset-bottom, 0px));
+  }
+
+  /* During gameplay: everything in normal flow so canvas shrinks to fit */
+  #game-wrapper.game-playing {
+    padding-bottom: max(8px, var(--browser-chrome-bottom, 0px), env(safe-area-inset-bottom, 0px));
+  }
+
+  #game-wrapper.game-playing #canvas-container {
+    order: 0;
+    flex: 1;
+    min-height: 120px;
+    max-height: none;
+  }
+
+  #game-wrapper.game-playing #hotbar {
+    order: 1;
+    width: 100%;
+    padding: 4px 0;
+    flex-shrink: 0;
+  }
+
+  #game-wrapper.game-playing #mobile-controls {
+    display: flex;
+    order: 2;
+    flex-shrink: 0;
+    width: 100%;
+    padding: 6px 0 0;
+    border-top: 1px solid #006600;
+  }
+
+  #game-wrapper.game-playing #hotbar:not(:empty) + #mobile-controls {
+    border-top: none;
+  }
+}
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #000; }
+::-webkit-scrollbar-thumb { background: #003300; border: 1px solid #006600; }
+::-webkit-scrollbar-thumb:hover { background: #006600; }
