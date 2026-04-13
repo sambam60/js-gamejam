@@ -105,7 +105,7 @@
     assetList.forEach(name => {
       const img = new Image();
       const ext = name === 'little_gif_guy' ? 'gif' : 'png';
-      img.src = 'public/' + name + '.' + ext;
+      img.src = name + '.' + ext;
       img.onload = () => { assetsLoaded++; if (assetsLoaded >= assetList.length) onDone(); };
       img.onerror = () => { assetsLoaded++; if (assetsLoaded >= assetList.length) onDone(); };
       assets[name] = img;

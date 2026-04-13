@@ -2,7 +2,7 @@
 
 A browser platformer I made for a game jam. You run around drawing shapes as platforms while a boss fish chases you down and shoots at you.
 
-No build step — just open `index.html` in a browser.
+No build step — open `public/index.html` in a browser, or serve the `public` folder (e.g. `npx serve public`). That layout matches Vercel, which uses `public/` as the site root for static projects.
 
 ## Controls
 

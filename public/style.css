@@ -1,30 +1,30 @@
 @font-face {
   font-family: 'Redaction 35';
-  src: url('public/fonts/redaction-35-latin-400-normal.ttf') format('truetype');
+  src: url('fonts/redaction-35-latin-400-normal.ttf') format('truetype');
   font-weight: 400;
   font-style: normal;
 }
 @font-face {
   font-family: 'Redaction 35';
-  src: url('public/fonts/redaction-35-latin-700-normal.ttf') format('truetype');
+  src: url('fonts/redaction-35-latin-700-normal.ttf') format('truetype');
   font-weight: 700;
   font-style: normal;
 }
 @font-face {
   font-family: 'Redaction 35';
-  src: url('public/fonts/redaction-35-latin-400-italic.ttf') format('truetype');
+  src: url('fonts/redaction-35-latin-400-italic.ttf') format('truetype');
   font-weight: 400;
   font-style: italic;
 }
 @font-face {
   font-family: 'Redaction 35';
-  src: url('public/fonts/redaction-35-latin-700-italic.ttf') format('truetype');
+  src: url('fonts/redaction-35-latin-700-italic.ttf') format('truetype');
   font-weight: 700;
   font-style: italic;
 }
 @font-face {
   font-family: 'Berkeley Mono';
-  src: url('public/fonts/Berkeley Mono Variable.ttf') format('truetype');
+  src: url('fonts/Berkeley Mono Variable.ttf') format('truetype');
   font-weight: 100 900;
   font-style: normal;
 }
