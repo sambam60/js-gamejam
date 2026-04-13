@@ -263,13 +263,21 @@
     }
   }
 
-  // dreamlo leaderboard API — on https we need a CORS proxy since dreamlo is http-only
+  // dreamlo is http-only with no CORS — use same-origin /api/dreamlo proxy on https (Vercel)
   function dreamloUrl(path) {
-    const raw = 'http://dreamlo.com/lb/' + path;
+    const direct = 'http://dreamlo.com/lb/' + path;
     if (location.protocol === 'https:') {
-      return 'https://api.allorigins.win/raw?url=' + encodeURIComponent(raw);
+      return '/api/dreamlo?path=' + encodeURIComponent(path);
     }
-    return raw;
+    return direct;
+  }
+
+  function formatLeaderboardTime(totalSec) {
+    const s = Math.max(0, Math.floor(totalSec));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    const minStr = m < 100 ? String(m).padStart(2, '0') : String(m);
+    return minStr + ':' + String(r).padStart(2, '0');
   }
 
   function fetchLeaderboard() {
@@ -284,7 +292,13 @@
       const lines = xhr.responseText.trim().split('\n').filter(Boolean);
       menu.leaderboard = lines.slice(0, 10).map(function (line) {
         const parts = line.split('|');
-        return { name: parts[0] || '???', score: parseInt(parts[1], 10) || 0 };
+        const timeRaw = parts[2];
+        const timeSec = timeRaw !== undefined && timeRaw !== '' ? parseInt(timeRaw, 10) : NaN;
+        return {
+          name: parts[0] || '???',
+          score: parseInt(parts[1], 10) || 0,
+          timeSec: Number.isFinite(timeSec) ? timeSec : null,
+        };
       });
       menu.lbLastFetch = Date.now();
       menu.lbLoading = false;
@@ -293,10 +307,12 @@
     xhr.send();
   }
 
-  function submitScore(name, score) {
+  function submitScore(name, score, timeSeconds) {
     if (!DREAMLO_PRIVATE || !name || score <= 0) return;
+    const t = Math.max(0, Math.floor(timeSeconds || 0));
+    const path = DREAMLO_PRIVATE + '/add/' + encodeURIComponent(name) + '/' + score + '/' + t;
     const xhr = new XMLHttpRequest();
-    xhr.open('GET', dreamloUrl(DREAMLO_PRIVATE + '/add/' + encodeURIComponent(name) + '/' + score));
+    xhr.open('GET', dreamloUrl(path));
     xhr.onload = function () { menu.lbLastFetch = 0; fetchLeaderboard(); };
     xhr.onerror = function () {};
     xhr.send();
@@ -959,7 +975,8 @@
     menu.scoreSubmitted = true;
     if (hasCheatsEnabled()) return;
     const name = menu.playerName || 'ANON';
-    submitScore(name, state.score);
+    const survivedSec = Math.floor((Date.now() - state.gameStartTime) / 1000);
+    submitScore(name, state.score, survivedSec);
   }
 
   function ejectPlayerFromShape(shape) {
@@ -1743,7 +1760,7 @@
     if (state.phase === 'gameover') {
       ctx.fillStyle = 'rgba(0,0,0,0.88)'; ctx.fillRect(0, 0, W, H);
 
-      const panelW = Math.min(420, W - 40), panelH = 220;
+      const panelW = Math.min(420, W - 40), panelH = 236;
       const panelX = (W - panelW) / 2, panelY = (H - panelH) / 2;
 
       ctx.strokeStyle = COL.redDim; ctx.lineWidth = 1;
@@ -1762,16 +1779,20 @@
       ctx.fillText('GAME OVER', W / 2, panelY + 80); ctx.restore();
 
       ctx.font = '13px ' + FONT_MONO; ctx.textAlign = 'center';
-      ctx.fillStyle = COL.mid; ctx.fillText('FINAL SCORE', W / 2, panelY + 115);
+      ctx.fillStyle = COL.mid; ctx.fillText('FINAL SCORE', W / 2, panelY + 108);
       ctx.fillStyle = COL.bright; ctx.font = '20px ' + FONT_MONO;
-      ctx.fillText(String(state.score), W / 2, panelY + 142);
+      ctx.fillText(String(state.score), W / 2, panelY + 134);
+
+      const goElapsed = Math.floor((Date.now() - state.gameStartTime) / 1000);
+      ctx.fillStyle = COL.mid; ctx.font = '11px ' + FONT_MONO;
+      ctx.fillText('TIME  ' + formatLeaderboardTime(goElapsed), W / 2, panelY + 158);
 
       if (menu.playerName) {
         ctx.fillStyle = COL.dim; ctx.font = '11px ' + FONT_MONO;
-        ctx.fillText('PLAYER: ' + menu.playerName.toUpperCase(), W / 2, panelY + 165);
+        ctx.fillText('PLAYER: ' + menu.playerName.toUpperCase(), W / 2, panelY + 178);
       }
       ctx.fillStyle = COL.shadow; ctx.font = '11px ' + FONT_MONO;
-      ctx.fillText(frameTick % 60 < 30 ? '> PRESS ENTER TO CONTINUE_' : '> PRESS ENTER TO CONTINUE', W / 2, panelY + 200);
+      ctx.fillText(frameTick % 60 < 30 ? '> PRESS ENTER TO CONTINUE_' : '> PRESS ENTER TO CONTINUE', W / 2, panelY + 208);
       ctx.textAlign = 'left';
     }
 
@@ -2084,7 +2105,7 @@
 
       let lbX, lbY, lbW, lbH;
       if (isSide) {
-        lbW = Math.min(200, sideSpace);
+        lbW = Math.min(216, sideSpace);
         const gap = W - padX - menuRight;
         lbX = menuRight + (gap - lbW) / 2;
         lbY = titleY - 10;
@@ -2110,6 +2131,7 @@
 
         ctx.textAlign = 'left';
         const entryH = 20;
+        const nameMaxW = lbW - 88;
         const maxEntries = Math.floor((lbH - 30) / entryH);
 
         if (menu.lbLoading && menu.leaderboard.length === 0) {
@@ -2134,13 +2156,21 @@
             let eName = (entry.name || '???').toUpperCase();
             ctx.font = (isTop3 ? 'bold ' : '') + '10px ' + FONT_MONO;
             ctx.fillStyle = isTop3 ? COL.cyan : COL.mid;
-            const nameMaxW = lbW - 56;
             while (eName.length > 2 && ctx.measureText(eName).width > nameMaxW) eName = eName.slice(0, -2) + '\u2026';
             ctx.fillText(eName, lbX + 22, ey + 13);
 
-            ctx.fillStyle = isTop3 ? COL.bright : COL.dim;
-            ctx.font = (isTop3 ? 'bold ' : '') + '10px ' + FONT_MONO; ctx.textAlign = 'right';
-            ctx.fillText(String(entry.score), lbX + lbW - 6, ey + 13);
+            const timeStr = entry.timeSec != null ? formatLeaderboardTime(entry.timeSec) : '--:--';
+            const scoreStr = String(entry.score);
+            const statsX = lbX + lbW - 6;
+            const rowY = ey + 13;
+            ctx.font = (isTop3 ? 'bold ' : '') + '10px ' + FONT_MONO;
+            ctx.textAlign = 'right';
+            ctx.fillStyle = isTop3 ? COL.bright : COL.primary;
+            ctx.fillText(scoreStr, statsX, rowY);
+            const scoreW = ctx.measureText(scoreStr).width;
+            ctx.fillStyle = isTop3 ? COL.cyanDim : COL.shadow;
+            ctx.font = '10px ' + FONT_MONO;
+            ctx.fillText(timeStr + '  ', statsX - scoreW, rowY);
             ctx.textAlign = 'left';
           }
         }
