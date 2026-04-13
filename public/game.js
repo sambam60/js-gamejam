@@ -369,8 +369,6 @@
       fishShootPulse: 0,
       fishFrozen: 0,
       freezeCooldown: 0,
-      bugsFrozen: 0,
-      danglysFrozen: 0,
       iceShards: [],
       laserCooldown: 0,
       laserBeams: [],
@@ -1414,34 +1412,36 @@
 
     if (state.fishShootPulse > 0) state.fishShootPulse--;
     if (state.fishFrozen > 0) state.fishFrozen--;
-    if (state.bugsFrozen > 0) state.bugsFrozen--;
-    if (state.danglysFrozen > 0) state.danglysFrozen--;
     if (state.freezeCooldown > 0) state.freezeCooldown--;
     if (state.laserCooldown > 0) state.laserCooldown--;
 
-    // ice shards — travel toward cursor, freeze ALL enemies on hit
+    // ice shards — travel toward cursor, freeze only the enemy hit
     state.iceShards = state.iceShards.filter(s => {
       s.x += s.vx; s.y += s.vy; s.life--;
       if (s.life <= 0) return false;
-      let hit = false;
       if (state.fish.spawned) {
         const dx = s.x - state.fish.x, dy = s.y - state.fish.y;
-        if (Math.sqrt(dx * dx + dy * dy) < 30) hit = true;
+        if (Math.sqrt(dx * dx + dy * dy) < 30) {
+          state.fishFrozen = 240;
+          spawnHitParticles(s.x, s.y, COL.cyan);
+          return false;
+        }
       }
       for (const b of state.bugs) {
         const dx = s.x - b.x, dy = s.y - b.y;
-        if (Math.sqrt(dx * dx + dy * dy) < 20) hit = true;
+        if (Math.sqrt(dx * dx + dy * dy) < 20) {
+          b.frozen = 240;
+          spawnHitParticles(s.x, s.y, COL.cyan);
+          return false;
+        }
       }
       for (const d of state.danglies) {
         const dx = s.x - (d.x + 9), dy = s.y - (d.y + 17);
-        if (Math.sqrt(dx * dx + dy * dy) < 24) hit = true;
-      }
-      if (hit) {
-        state.fishFrozen = 240;
-        state.bugsFrozen = 240;
-        state.danglysFrozen = 240;
-        spawnHitParticles(s.x, s.y, COL.cyan);
-        return false;
+        if (Math.sqrt(dx * dx + dy * dy) < 24) {
+          d.frozen = 240;
+          spawnHitParticles(s.x, s.y, COL.cyan);
+          return false;
+        }
       }
       return true;
     });
@@ -1581,27 +1581,35 @@
       return pt.life > 0;
     });
 
-    // bug enemies
+    // bug enemies — tick per-bug frozen timers, skip frozen bugs in update
     if (window.BugSystem) {
       const BS = window.BugSystem;
       if (elapsed > 4000) {
         state.lastBugSpawn = BS.maybeSpawn(state.bugs, state.playerX, state.lastBugSpawn, now);
       }
-      if (state.bugsFrozen <= 0) {
-        BS.updateAll(state.bugs, state.playerX, pB, state.squares, H, frameTick);
+      const unfrozenBugs = [];
+      for (const b of state.bugs) {
+        if (b.frozen > 0) { b.frozen--; } else { unfrozenBugs.push(b); }
+      }
+      if (unfrozenBugs.length > 0) {
+        BS.updateAll(unfrozenBugs, state.playerX, pB, state.squares, H, frameTick);
       }
       const bugDmg = BS.checkPlayerCollision(state.bugs, pL, pB, CHAR_W, CHAR_H);
       if (bugDmg > 0) { applyDamage(bugDmg); }
     }
 
-    // dangly enemies
+    // dangly enemies — tick per-dangly frozen timers, skip frozen danglies
     if (window.DanglySystem) {
       const DS = window.DanglySystem;
       if (elapsed > 8000) {
         state.lastDanglySpawn = DS.maybeSpawn(state.danglies, state.playerX, state.lastDanglySpawn, now);
       }
-      if (state.danglysFrozen <= 0) {
-        DS.updateAll(state.danglies, state.playerX, pB, state.squares, H, frameTick);
+      const unfrozenDanglies = [];
+      for (const d of state.danglies) {
+        if (d.frozen > 0) { d.frozen--; } else { unfrozenDanglies.push(d); }
+      }
+      if (unfrozenDanglies.length > 0) {
+        DS.updateAll(unfrozenDanglies, state.playerX, pB, state.squares, H, frameTick);
       }
       const danglyDmg = DS.checkPlayerCollision(state.danglies, pL, pB, CHAR_W, CHAR_H);
       if (danglyDmg > 0) { applyDamage(danglyDmg); }
@@ -2220,9 +2228,9 @@
       ctx.restore();
     }
 
-    // frozen ring around bugs when frozen
-    if (state.bugsFrozen > 0) {
-      for (const b of state.bugs) {
+    // frozen ring around individually frozen bugs
+    for (const b of state.bugs) {
+      if (b.frozen > 0) {
         const bx = b.x + 7 - cam, by = H - b.y - 6;
         ctx.save();
         ctx.strokeStyle = COL.cyan; ctx.lineWidth = 1.5;
@@ -2236,9 +2244,9 @@
       }
     }
 
-    // frozen ring around danglies when frozen
-    if (state.danglysFrozen > 0) {
-      for (const d of state.danglies) {
+    // frozen ring around individually frozen danglies
+    for (const d of state.danglies) {
+      if (d.frozen > 0) {
         const dx = d.x + 9 - cam, dy = H - d.y - 17;
         ctx.save();
         ctx.strokeStyle = COL.cyan; ctx.lineWidth = 1.5;
