@@ -370,6 +370,7 @@
       fishFrozen: 0,
       freezeCooldown: 0,
       bugsFrozen: 0,
+      danglysFrozen: 0,
       iceShards: [],
       laserCooldown: 0,
       laserBeams: [],
@@ -551,9 +552,9 @@
     } else if (tool === 'bomb') {
       placeBomb(p);
     } else if (tool === 'freeze') {
-      activateFreeze();
+      activateFreeze(p);
     } else if (tool === 'laser') {
-      fireLaser();
+      fireLaser(p);
     }
   });
   canvas.addEventListener('mouseup', () => { mouseHeld = false; releaseGrapple(); finishDrag(); });
@@ -593,9 +594,9 @@
     } else if (tool === 'bomb') {
       placeBomb(p);
     } else if (tool === 'freeze') {
-      activateFreeze();
+      activateFreeze(p);
     } else if (tool === 'laser') {
-      fireLaser();
+      fireLaser(p);
     }
   }, { passive: false });
   canvas.addEventListener('touchmove', e => {
@@ -829,33 +830,23 @@
     state.bombCooldown = 120;
   }
 
-  function activateFreeze() {
+  function activateFreeze(target) {
     if (state.freezeCooldown > 0) return;
     const pcx = state.playerX + CHAR_W / 2;
     const pcy = -state.playerY + CHAR_H / 2;
-    let tx = pcx + (state.direction === 'right' ? 300 : -300);
-    let ty = pcy;
-    let bestDist = Infinity;
-    if (state.fish.spawned) {
-      const d = Math.sqrt((state.fish.x - pcx) ** 2 + (state.fish.y - pcy) ** 2);
-      if (d < bestDist) { bestDist = d; tx = state.fish.x; ty = state.fish.y; }
-    }
-    for (const b of state.bugs) {
-      const d = Math.sqrt((b.x - pcx) ** 2 + (b.y - pcy) ** 2);
-      if (d < bestDist) { bestDist = d; tx = b.x; ty = b.y; }
-    }
-    const dx = tx - pcx, dy = ty - pcy;
+    const dx = target.x - pcx, dy = target.y - pcy;
     const dist = Math.sqrt(dx * dx + dy * dy) || 1;
     state.iceShards.push({ x: pcx, y: pcy, vx: (dx / dist) * 5, vy: (dy / dist) * 5, life: 120 });
     state.freezeCooldown = 600;
   }
 
-  function fireLaser() {
+  function fireLaser(target) {
     if (state.laserCooldown > 0) return;
     const pcx = state.playerX + CHAR_W / 2;
     const pcy = -state.playerY + CHAR_H / 2;
-    const dirMul = state.direction === 'right' ? 1 : -1;
-    state.laserBeams.push({ x: pcx, y: pcy, vx: dirMul * 8, vy: 0, life: 60 });
+    const dx = target.x - pcx, dy = target.y - pcy;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    state.laserBeams.push({ x: pcx, y: pcy, vx: (dx / dist) * 8, vy: (dy / dist) * 8, life: 60 });
     state.laserCooldown = 45;
   }
 
@@ -1424,10 +1415,11 @@
     if (state.fishShootPulse > 0) state.fishShootPulse--;
     if (state.fishFrozen > 0) state.fishFrozen--;
     if (state.bugsFrozen > 0) state.bugsFrozen--;
+    if (state.danglysFrozen > 0) state.danglysFrozen--;
     if (state.freezeCooldown > 0) state.freezeCooldown--;
     if (state.laserCooldown > 0) state.laserCooldown--;
 
-    // ice shards — travel toward enemies, freeze ALL on hit
+    // ice shards — travel toward cursor, freeze ALL enemies on hit
     state.iceShards = state.iceShards.filter(s => {
       s.x += s.vx; s.y += s.vy; s.life--;
       if (s.life <= 0) return false;
@@ -1440,9 +1432,14 @@
         const dx = s.x - b.x, dy = s.y - b.y;
         if (Math.sqrt(dx * dx + dy * dy) < 20) hit = true;
       }
+      for (const d of state.danglies) {
+        const dx = s.x - (d.x + 9), dy = s.y - (d.y + 17);
+        if (Math.sqrt(dx * dx + dy * dy) < 24) hit = true;
+      }
       if (hit) {
         state.fishFrozen = 240;
         state.bugsFrozen = 240;
+        state.danglysFrozen = 240;
         spawnHitParticles(s.x, s.y, COL.cyan);
         return false;
       }
@@ -1461,15 +1458,22 @@
           return false;
         }
       }
-      if (window.BugSystem) {
-        for (const b of state.bugs) {
-          const dx = l.x - (b.x + 7), dy = l.y - (b.y + 6);
-          if (Math.sqrt(dx * dx + dy * dy) < 20) {
-            b.hp -= 12;
-            b.hurtTimer = 10;
-            spawnHitParticles(l.x, l.y, COL.red);
-            return false;
-          }
+      for (const b of state.bugs) {
+        const dx = l.x - (b.x + 7), dy = l.y - (b.y + 6);
+        if (Math.sqrt(dx * dx + dy * dy) < 20) {
+          b.hp -= 12;
+          b.hurtTimer = 10;
+          spawnHitParticles(l.x, l.y, COL.red);
+          return false;
+        }
+      }
+      for (const d of state.danglies) {
+        const dx = l.x - (d.x + 9), dy = l.y - (d.y + 17);
+        if (Math.sqrt(dx * dx + dy * dy) < 24) {
+          d.hp -= 15;
+          d.hurtTimer = 10;
+          spawnHitParticles(l.x, l.y, COL.red);
+          return false;
         }
       }
       return true;
@@ -1596,7 +1600,9 @@
       if (elapsed > 8000) {
         state.lastDanglySpawn = DS.maybeSpawn(state.danglies, state.playerX, state.lastDanglySpawn, now);
       }
-      DS.updateAll(state.danglies, state.playerX, pB, state.squares, H, frameTick);
+      if (state.danglysFrozen <= 0) {
+        DS.updateAll(state.danglies, state.playerX, pB, state.squares, H, frameTick);
+      }
       const danglyDmg = DS.checkPlayerCollision(state.danglies, pL, pB, CHAR_W, CHAR_H);
       if (danglyDmg > 0) { applyDamage(danglyDmg); }
     }
@@ -2225,6 +2231,22 @@
         ctx.beginPath(); ctx.arc(bx, by, 12, 0, Math.PI * 2); ctx.stroke();
         ctx.font = '8px ' + FONT_MONO; ctx.fillStyle = COL.cyan; ctx.textAlign = 'center';
         ctx.fillText('\u2744', bx, by - 14);
+        ctx.textAlign = 'left';
+        ctx.restore();
+      }
+    }
+
+    // frozen ring around danglies when frozen
+    if (state.danglysFrozen > 0) {
+      for (const d of state.danglies) {
+        const dx = d.x + 9 - cam, dy = H - d.y - 17;
+        ctx.save();
+        ctx.strokeStyle = COL.cyan; ctx.lineWidth = 1.5;
+        ctx.shadowColor = 'rgba(0,255,204,0.5)'; ctx.shadowBlur = 8;
+        ctx.globalAlpha = 0.4 + Math.sin(frameTick * 0.15) * 0.3;
+        ctx.beginPath(); ctx.arc(dx, dy, 20, 0, Math.PI * 2); ctx.stroke();
+        ctx.font = '10px ' + FONT_MONO; ctx.fillStyle = COL.cyan; ctx.textAlign = 'center';
+        ctx.fillText('\u2744', dx, dy - 22);
         ctx.textAlign = 'left';
         ctx.restore();
       }
