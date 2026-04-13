@@ -97,7 +97,6 @@
   const assetList = [
     'idle_1', 'idle_2', 'idle_3', 'little_gif_guy',
     'coin', 'coin2', 'coin3', 'coin4',
-    'evil_fish_eye'
   ];
   let assetsLoaded = 0;
 
@@ -119,7 +118,7 @@
   const MOVE_SPEED = 2;
   const SPRINT_SPEED = 3.6;
   const JUMP_VEL = -6;
-  const FISH_SPAWN_DELAY = 6000;
+  const FISH_SPAWN_DELAY = 120000;
   const idleImages = ['idle_1', 'idle_2', 'idle_3'];
   const COIN_VALUES = { 1: 1, 2: 5, 3: 10, 4: 15 };
 
@@ -138,6 +137,7 @@
     reflector: { name: 'REFLECTOR', icon: '\u2B29' },
     bomb:      { name: 'BOMB',      icon: '\u25C9' },
     freeze:    { name: 'FREEZE',    icon: '\u2744' },
+    laser:     { name: 'LASER',     icon: '\u2301' },
   };
 
   const UPGRADE_DEFS = {
@@ -162,6 +162,7 @@
     reflector:  { name: 'REFLECTOR',    cost: 45,  type: 'tool', tool: 'reflector' },
     bomb:       { name: 'BOMB',         cost: 35,  type: 'tool', tool: 'bomb' },
     freeze:     { name: 'FREEZE RAY',   cost: 65,  type: 'tool', tool: 'freeze' },
+    laser:      { name: 'LASER GUN',   cost: 50,  type: 'tool', tool: 'laser' },
   };
 
   // menu state
@@ -169,7 +170,7 @@
 
   const CHEAT_CATEGORIES = [
     { id: 'shapes',   label: 'SHAPES',   keys: ['circle','triangle','line','bezier','polygon','eraser'] },
-    { id: 'weapons',  label: 'WEAPONS',  keys: ['sword','bomb','reflector','freeze'] },
+    { id: 'weapons',  label: 'WEAPONS',  keys: ['sword','bomb','reflector','freeze','laser'] },
     { id: 'movement', label: 'MOVEMENT', keys: ['doubleJump','sprint','wallClimb','glide','dash'] },
     { id: 'utility',  label: 'UTILITY',  keys: ['portal','grapple','coinMagnet','armor','regen','reinforce'] },
   ];
@@ -343,17 +344,20 @@
       upgrades: [], lastUpgradeSpawn: 0,
       activeUpgrades: {},
       health: 100, gameStartTime: 0,
-      fish: { x: -200, y: 200, speed: 0.4, spawned: false, rotation: 0, lastShot: 0 },
+      fish: { x: -200, y: 200, speed: 0.4, spawned: false, rotation: 0, lastShot: 0, touchCd: 0 },
       fishHP: 100, fishMaxHP: 100, fishRespawnTime: 0,
       projectiles: [],
       inventory: ['square'],
       selectedSlot: 0,
       portals: [],
       portalCooldown: 0,
+      portalBoostVX: 0,
       swordCooldown: 0,
       swordSwing: null,
       bugs: [],
       lastBugSpawn: 0,
+      danglies: [],
+      lastDanglySpawn: 0,
       polyPoints: [],
       bezierPoints: [],
       grapple: null,
@@ -362,13 +366,19 @@
       reflectorCooldown: 0,
       bombs: [],
       bombCooldown: 0,
+      fishShootPulse: 0,
       fishFrozen: 0,
       freezeCooldown: 0,
+      bugsFrozen: 0,
+      iceShards: [],
+      laserCooldown: 0,
+      laserBeams: [],
       dashCooldown: 0,
       dashActive: 0,
       regenTick: 0,
       damageFlash: 0,
       pauseStart: 0,
+      particles: [],
     };
   }
 
@@ -429,6 +439,7 @@
         state.lastHeartSpawn += pausedMs;
         state.lastUpgradeSpawn += pausedMs;
         state.lastBugSpawn += pausedMs;
+        state.lastDanglySpawn += pausedMs;
         if (state.fish.lastShot) state.fish.lastShot += pausedMs;
         if (state.fishRespawnTime > 0) state.fishRespawnTime += pausedMs;
         state.phase = 'playing';
@@ -541,6 +552,8 @@
       placeBomb(p);
     } else if (tool === 'freeze') {
       activateFreeze();
+    } else if (tool === 'laser') {
+      fireLaser();
     }
   });
   canvas.addEventListener('mouseup', () => { mouseHeld = false; releaseGrapple(); finishDrag(); });
@@ -581,6 +594,8 @@
       placeBomb(p);
     } else if (tool === 'freeze') {
       activateFreeze();
+    } else if (tool === 'laser') {
+      fireLaser();
     }
   }, { passive: false });
   canvas.addEventListener('touchmove', e => {
@@ -607,15 +622,17 @@
       const ccy = (state.dragStart.y + state.dragCurrent.y) / 2;
       const r = Math.min(w, h) / 2;
       if (r > 4) {
-        newShape = { x: ccx - r, y: ccy - r, width: r * 2, height: r * 2, shape: 'circle', cx: ccx, cy: ccy, r: r };
+        newShape = { x: ccx - r, y: ccy - r, width: r * 2, height: r * 2, shape: 'circle', cx: ccx, cy: ccy, r: r, segments: generateCircleSegments(ccx, ccy, r) };
       }
     } else if (tool === 'triangle') {
       if (w > 4 && h > 4) {
+        const tv1 = { x: sx + w / 2, y: sy + h };
+        const tv2 = { x: sx, y: sy };
+        const tv3 = { x: sx + w, y: sy };
         newShape = {
           x: sx, y: sy, width: w, height: h, shape: 'triangle',
-          v1: { x: sx + w / 2, y: sy + h },
-          v2: { x: sx, y: sy },
-          v3: { x: sx + w, y: sy },
+          v1: tv1, v2: tv2, v3: tv3,
+          segments: generateTriangleSegments(tv1, tv2, tv3),
         };
       }
     } else if (tool === 'line') {
@@ -688,6 +705,7 @@
       else if (inv[i] === 'grapple' && state.grappleCooldown > 0) cdPct = (state.grappleCooldown / 90) * 100;
       else if (inv[i] === 'bomb' && state.bombCooldown > 0) cdPct = (state.bombCooldown / 120) * 100;
       else if (inv[i] === 'freeze' && state.freezeCooldown > 0) cdPct = (state.freezeCooldown / 600) * 100;
+      else if (inv[i] === 'laser' && state.laserCooldown > 0) cdPct = (state.laserCooldown / 45) * 100;
       else if (inv[i] === 'reflector' && state.reflectorCooldown > 0) cdPct = (state.reflectorCooldown / 30) * 100;
       cdEl.style.height = Math.round(cdPct) + '%';
     }
@@ -727,7 +745,8 @@
       if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y;
       if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
     }
-    const shape = { x: minX, y: minY, width: maxX - minX, height: maxY - minY, shape: 'polygon', vertices: pts.slice() };
+    const verts = pts.slice();
+    const shape = { x: minX, y: minY, width: maxX - minX, height: maxY - minY, shape: 'polygon', vertices: verts, segments: generatePolygonSegments(verts) };
     state.squares.push(shape);
     ejectPlayerFromShape(shape);
     state.polyPoints = [];
@@ -811,9 +830,33 @@
   }
 
   function activateFreeze() {
-    if (state.freezeCooldown > 0 || !state.fish.spawned) return;
-    state.fishFrozen = 180;
+    if (state.freezeCooldown > 0) return;
+    const pcx = state.playerX + CHAR_W / 2;
+    const pcy = -state.playerY + CHAR_H / 2;
+    let tx = pcx + (state.direction === 'right' ? 300 : -300);
+    let ty = pcy;
+    let bestDist = Infinity;
+    if (state.fish.spawned) {
+      const d = Math.sqrt((state.fish.x - pcx) ** 2 + (state.fish.y - pcy) ** 2);
+      if (d < bestDist) { bestDist = d; tx = state.fish.x; ty = state.fish.y; }
+    }
+    for (const b of state.bugs) {
+      const d = Math.sqrt((b.x - pcx) ** 2 + (b.y - pcy) ** 2);
+      if (d < bestDist) { bestDist = d; tx = b.x; ty = b.y; }
+    }
+    const dx = tx - pcx, dy = ty - pcy;
+    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+    state.iceShards.push({ x: pcx, y: pcy, vx: (dx / dist) * 5, vy: (dy / dist) * 5, life: 120 });
     state.freezeCooldown = 600;
+  }
+
+  function fireLaser() {
+    if (state.laserCooldown > 0) return;
+    const pcx = state.playerX + CHAR_W / 2;
+    const pcy = -state.playerY + CHAR_H / 2;
+    const dirMul = state.direction === 'right' ? 1 : -1;
+    state.laserBeams.push({ x: pcx, y: pcy, vx: dirMul * 8, vy: 0, life: 60 });
+    state.laserCooldown = 45;
   }
 
   // figure out which menu row was clicked
@@ -959,6 +1002,102 @@
     return segs;
   }
 
+  function generateCircleSegments(cx, cy, r) {
+    const segs = [];
+    const steps = Math.max(6, Math.ceil(r / 3));
+    for (let i = 0; i < steps; i++) {
+      const y0 = cy - r + (2 * r * i / steps);
+      const y1 = cy - r + (2 * r * (i + 1) / steps);
+      const midY = (y0 + y1) / 2;
+      const dy = midY - cy;
+      const halfW = Math.sqrt(Math.max(0, r * r - dy * dy));
+      if (halfW > 0.5) {
+        segs.push({ x: cx - halfW, y: y0, width: halfW * 2, height: y1 - y0 });
+      }
+    }
+    return segs;
+  }
+
+  function generateTriangleSegments(v1, v2, v3) {
+    const segs = [];
+    const minY = Math.min(v1.y, v2.y, v3.y);
+    const maxY = Math.max(v1.y, v2.y, v3.y);
+    const height = maxY - minY;
+    if (height < 1) return segs;
+    const steps = Math.max(6, Math.ceil(height / 3));
+    const edges = [[v1, v2], [v2, v3], [v3, v1]];
+    for (let i = 0; i < steps; i++) {
+      const y0 = minY + (height * i / steps);
+      const y1 = minY + (height * (i + 1) / steps);
+      const midY = (y0 + y1) / 2;
+      const xs = [];
+      for (const [a, b] of edges) {
+        if ((a.y <= midY && b.y > midY) || (b.y <= midY && a.y > midY)) {
+          const t = (midY - a.y) / (b.y - a.y);
+          xs.push(a.x + t * (b.x - a.x));
+        }
+      }
+      if (xs.length >= 2) {
+        const xMin = Math.min.apply(null, xs);
+        const xMax = Math.max.apply(null, xs);
+        if (xMax - xMin > 0.5) {
+          segs.push({ x: xMin, y: y0, width: xMax - xMin, height: y1 - y0 });
+        }
+      }
+    }
+    return segs;
+  }
+
+  function generatePolygonSegments(vertices) {
+    const segs = [];
+    let minY = Infinity, maxY = -Infinity;
+    for (const v of vertices) {
+      if (v.y < minY) minY = v.y;
+      if (v.y > maxY) maxY = v.y;
+    }
+    const height = maxY - minY;
+    if (height < 1) return segs;
+    const steps = Math.max(6, Math.ceil(height / 3));
+    for (let i = 0; i < steps; i++) {
+      const y0 = minY + (height * i / steps);
+      const y1 = minY + (height * (i + 1) / steps);
+      const midY = (y0 + y1) / 2;
+      const xs = [];
+      for (let j = 0; j < vertices.length; j++) {
+        const a = vertices[j];
+        const b = vertices[(j + 1) % vertices.length];
+        if ((a.y <= midY && b.y > midY) || (b.y <= midY && a.y > midY)) {
+          const t = (midY - a.y) / (b.y - a.y);
+          xs.push(a.x + t * (b.x - a.x));
+        }
+      }
+      xs.sort(function (a, b) { return a - b; });
+      for (let j = 0; j + 1 < xs.length; j += 2) {
+        if (xs[j + 1] - xs[j] > 0.5) {
+          segs.push({ x: xs[j], y: y0, width: xs[j + 1] - xs[j], height: y1 - y0 });
+        }
+      }
+    }
+    return segs;
+  }
+
+  function spawnHitParticles(x, y, color) {
+    const count = 5 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < count; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 0.5 + Math.random() * 1.5;
+      state.particles.push({
+        x: x, y: y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 12 + Math.floor(Math.random() * 8),
+        maxLife: 12 + Math.floor(Math.random() * 8),
+        size: 1 + Math.floor(Math.random() * 3),
+        color: color,
+      });
+    }
+  }
+
   function applyDamage(amount) {
     if (state.activeUpgrades.armor) amount = Math.ceil(amount * 0.6);
     state.health = Math.max(0, state.health - amount);
@@ -1007,9 +1146,11 @@
     const dx = state.playerX - oldX;
     const dy = state.playerY - oldY;
     const dist = Math.sqrt(dx * dx + dy * dy);
-    const pct = Math.min(dist / 200, 0.5);
-    const dmg = Math.max(1, Math.floor(state.health * pct));
-    applyDamage(dmg);
+    if (dist >= 30) {
+      const pct = Math.min(dist / 200, 0.5);
+      const dmg = Math.max(1, Math.floor(state.health * pct));
+      applyDamage(dmg);
+    }
   }
 
   function resolveVertical(proposedY, px, squares, vy) {
@@ -1072,7 +1213,9 @@
     }
 
     const colRects = getCollisionRects();
-    const proposedX = state.playerX + dir * speed + grappleHX;
+    const proposedX = state.playerX + dir * speed + grappleHX + state.portalBoostVX;
+    state.portalBoostVX *= 0.92;
+    if (Math.abs(state.portalBoostVX) < 0.05) state.portalBoostVX = 0;
     const hDir = proposedX > state.playerX ? 1 : proposedX < state.playerX ? -1 : dir;
     const resolvedX = resolveHorizontal(proposedX, -state.playerY, colRects, hDir);
 
@@ -1105,15 +1248,22 @@
     targetCam = Math.max(0, targetCam);
     state.cameraX += (targetCam - state.cameraX) * 0.08;
 
-    // portal teleport
+    // portal teleport — rectangular hitbox, momentum preserved
+    const PORTAL_HIT_W = 14, PORTAL_HIT_H = 48;
     if (state.portals.length === 2 && state.portalCooldown <= 0) {
       const pL2 = state.playerX, pB2 = -state.playerY;
       for (let i = 0; i < 2; i++) {
         const pt = state.portals[i], other = state.portals[1 - i];
-        if (overlap(pL2, pB2, CHAR_W, CHAR_H, pt.x - 12, pt.y - 12, 24, 24)) {
+        if (overlap(pL2, pB2, CHAR_W, CHAR_H,
+                    pt.x - PORTAL_HIT_W / 2, pt.y - PORTAL_HIT_H / 2,
+                    PORTAL_HIT_W, PORTAL_HIT_H)) {
+          const entryVX = dir * speed + state.portalBoostVX;
           state.playerX = other.x - CHAR_W / 2;
           state.playerY = -(other.y - CHAR_H / 2);
-          state.portalCooldown = 60;
+          state.portalBoostVX = entryVX * 1.15;
+          spawnHitParticles(pt.x, pt.y, i === 0 ? '#3399ff' : '#ff8c1a');
+          spawnHitParticles(other.x, other.y, (1 - i) === 0 ? '#3399ff' : '#ff8c1a');
+          state.portalCooldown = 20;
           break;
         }
       }
@@ -1139,6 +1289,11 @@
         if (window.BugSystem) {
           const bugKills = window.BugSystem.swordHitBugs(state.bugs, pcx, pcy, 60);
           state.score += bugKills * 10;
+        }
+        // check danglies
+        if (window.DanglySystem) {
+          const danglyKills = window.DanglySystem.swordHitDanglies(state.danglies, pcx, pcy, 60);
+          state.score += danglyKills * 15;
         }
         // deflect nearby projectiles
         state.projectiles = state.projectiles.filter(p => {
@@ -1266,9 +1421,59 @@
     if (state.bombCooldown > 0) state.bombCooldown--;
     if (state.reflectorCooldown > 0) state.reflectorCooldown--;
 
-    // tick down freeze and freeze cooldown
+    if (state.fishShootPulse > 0) state.fishShootPulse--;
     if (state.fishFrozen > 0) state.fishFrozen--;
+    if (state.bugsFrozen > 0) state.bugsFrozen--;
     if (state.freezeCooldown > 0) state.freezeCooldown--;
+    if (state.laserCooldown > 0) state.laserCooldown--;
+
+    // ice shards — travel toward enemies, freeze ALL on hit
+    state.iceShards = state.iceShards.filter(s => {
+      s.x += s.vx; s.y += s.vy; s.life--;
+      if (s.life <= 0) return false;
+      let hit = false;
+      if (state.fish.spawned) {
+        const dx = s.x - state.fish.x, dy = s.y - state.fish.y;
+        if (Math.sqrt(dx * dx + dy * dy) < 30) hit = true;
+      }
+      for (const b of state.bugs) {
+        const dx = s.x - b.x, dy = s.y - b.y;
+        if (Math.sqrt(dx * dx + dy * dy) < 20) hit = true;
+      }
+      if (hit) {
+        state.fishFrozen = 240;
+        state.bugsFrozen = 240;
+        spawnHitParticles(s.x, s.y, COL.cyan);
+        return false;
+      }
+      return true;
+    });
+
+    // laser beams — travel fast, deal damage on contact
+    state.laserBeams = state.laserBeams.filter(l => {
+      l.x += l.vx; l.y += l.vy; l.life--;
+      if (l.life <= 0) return false;
+      if (state.fish.spawned) {
+        const dx = l.x - state.fish.x, dy = l.y - state.fish.y;
+        if (Math.sqrt(dx * dx + dy * dy) < 25) {
+          state.fishHP -= 18;
+          spawnHitParticles(l.x, l.y, COL.red);
+          return false;
+        }
+      }
+      if (window.BugSystem) {
+        for (const b of state.bugs) {
+          const dx = l.x - (b.x + 7), dy = l.y - (b.y + 6);
+          if (Math.sqrt(dx * dx + dy * dy) < 20) {
+            b.hp -= 12;
+            b.hurtTimer = 10;
+            spawnHitParticles(l.x, l.y, COL.red);
+            return false;
+          }
+        }
+      }
+      return true;
+    });
 
     // fish boss AI — spawns, chases, shoots, respawns harder each time
     const elapsed = now - state.gameStartTime;
@@ -1278,10 +1483,10 @@
       fish.spawned = false;
       state.score += 50;
       state.projectiles = [];
-      state.fishRespawnTime = now + 8000;
+      state.fishRespawnTime = now + 90000;
       state.fishMaxHP = Math.floor(state.fishMaxHP * 1.3);
     }
-    if (!fish.spawned && state.fishRespawnTime > 0 && now >= state.fishRespawnTime) {
+    if (!fish.spawned && state.fishRespawnTime > 0 && now >= state.fishRespawnTime && Math.random() < 0.002) {
       fish.spawned = true;
       fish.x = state.playerX + 400;
       fish.y = H * 0.5;
@@ -1291,7 +1496,7 @@
       state.fishRespawnTime = 0;
     }
 
-    if (!fish.spawned && elapsed >= FISH_SPAWN_DELAY && state.fishRespawnTime === 0) {
+    if (!fish.spawned && elapsed >= FISH_SPAWN_DELAY && state.fishRespawnTime === 0 && Math.random() < 0.002) {
       fish.spawned = true; fish.x = state.playerX + 400; fish.y = H * 0.5; fish.speed = 0.4; fish.lastShot = now;
       state.fishHP = state.fishMaxHP;
     }
@@ -1308,8 +1513,13 @@
         let type = roll > 0.92 ? 'blue' : roll > 0.82 ? 'yellow' : 'red';
         state.projectiles.push({ id: 'fp' + now + Math.random(), x: fish.x, y: fish.y, vx: (dx / dist) * 2.5, vy: (dy / dist) * 2.5, type });
         fish.lastShot = now;
+        state.fishShootPulse = 18;
       }
-      if (overlap(pL, pB, CHAR_W, CHAR_H, fish.x - 18, fish.y - 18, 36, 36)) { state.health = 0; state.phase = 'gameover'; onGameOver(); }
+      if (fish.touchCd > 0) fish.touchCd--;
+      if (fish.touchCd <= 0 && overlap(pL, pB, CHAR_W, CHAR_H, fish.x - 18, fish.y - 18, 36, 36)) {
+        applyDamage(15);
+        fish.touchCd = 60;
+      }
     }
 
     // reflector — flip projectile velocity on contact
@@ -1325,18 +1535,25 @@
     }
 
     const colRectsProj = getCollisionRects();
+    const projColors = { red: COL.red, blue: '#4488ee', yellow: COL.amber };
     state.projectiles = state.projectiles.filter(p => {
       p.x += p.vx; p.y += p.vy;
       if ((p.x - state.playerX) ** 2 + (p.y + state.playerY) ** 2 > 640000) return false;
+      if (p.y <= 0) { spawnHitParticles(p.x, 0, projColors[p.type]); return false; }
       if (p.reflected && state.fish.spawned) {
         const rdx = p.x - state.fish.x, rdy = p.y - state.fish.y;
-        if (Math.sqrt(rdx * rdx + rdy * rdy) < 20) { state.fishHP -= 15; return false; }
+        if (Math.sqrt(rdx * rdx + rdy * rdy) < 20) { state.fishHP -= 15; spawnHitParticles(p.x, p.y, projColors[p.type]); return false; }
       }
       const ps = 6, plx = p.x - ps / 2, pby = p.y - ps / 2;
-      if (p.type === 'red' || p.reflected) { for (const s of colRectsProj) { if (overlap(plx, pby, ps, ps, s.x, s.y, s.width, s.height)) return false; } }
+      if (p.type === 'red' || p.reflected) {
+        for (const s of colRectsProj) {
+          if (overlap(plx, pby, ps, ps, s.x, s.y, s.width, s.height)) { spawnHitParticles(p.x, p.y, projColors[p.type]); return false; }
+        }
+      }
       if (p.type === 'yellow' && !state.activeUpgrades.reinforce && !p.reflected) {
         const before = state.squares.length;
         state.squares = state.squares.filter(s => !overlap(plx, pby, ps, ps, s.x, s.y, s.width, s.height));
+        if (state.squares.length < before) spawnHitParticles(p.x, p.y, projColors[p.type]);
         if (state.grapple && state.squares.length < before && state.squares.indexOf(state.grapple.shape) === -1) {
           state.grapple = null;
           state.grappleCooldown = 90;
@@ -1344,9 +1561,20 @@
       }
       if (!p.reflected && overlap(pL, pB, CHAR_W, CHAR_H, plx, pby, ps, ps)) {
         applyDamage(p.type === 'red' ? 12 : 6);
+        spawnHitParticles(p.x, p.y, projColors[p.type]);
         return false;
       }
       return true;
+    });
+
+    // update hit particles
+    state.particles = state.particles.filter(pt => {
+      pt.x += pt.vx;
+      pt.y += pt.vy;
+      pt.vx *= 0.92;
+      pt.vy *= 0.92;
+      pt.life--;
+      return pt.life > 0;
     });
 
     // bug enemies
@@ -1355,9 +1583,22 @@
       if (elapsed > 4000) {
         state.lastBugSpawn = BS.maybeSpawn(state.bugs, state.playerX, state.lastBugSpawn, now);
       }
-      BS.updateAll(state.bugs, state.playerX, pB, state.squares, H, frameTick);
+      if (state.bugsFrozen <= 0) {
+        BS.updateAll(state.bugs, state.playerX, pB, state.squares, H, frameTick);
+      }
       const bugDmg = BS.checkPlayerCollision(state.bugs, pL, pB, CHAR_W, CHAR_H);
       if (bugDmg > 0) { applyDamage(bugDmg); }
+    }
+
+    // dangly enemies
+    if (window.DanglySystem) {
+      const DS = window.DanglySystem;
+      if (elapsed > 8000) {
+        state.lastDanglySpawn = DS.maybeSpawn(state.danglies, state.playerX, state.lastDanglySpawn, now);
+      }
+      DS.updateAll(state.danglies, state.playerX, pB, state.squares, H, frameTick);
+      const danglyDmg = DS.checkPlayerCollision(state.danglies, pL, pB, CHAR_W, CHAR_H);
+      if (danglyDmg > 0) { applyDamage(danglyDmg); }
     }
   }
 
@@ -1510,18 +1751,19 @@
       }
     }
 
-    // portals
+    // portals (Portal 2 blue/orange)
     for (let i = 0; i < state.portals.length; i++) {
       const pt = state.portals[i];
       const ptx = pt.x - cam, pty = H - pt.y;
-      const col = i === 0 ? COL.bright : COL.cyan;
-      const glow = i === 0 ? COL.glowStrong : 'rgba(0,255,204,0.35)';
+      const col = i === 0 ? '#3399ff' : '#ff8c1a';
+      const colInner = i === 0 ? '#1a6dd6' : '#cc6600';
+      const glow = i === 0 ? 'rgba(51,153,255,0.45)' : 'rgba(255,140,26,0.45)';
       const pulse = 0.7 + Math.sin(frameTick * 0.08 + i * 3) * 0.3;
       ctx.save();
       ctx.shadowColor = glow; ctx.shadowBlur = 18;
       ctx.strokeStyle = col; ctx.lineWidth = 2; ctx.globalAlpha = pulse;
       ctx.beginPath(); ctx.arc(ptx, pty, 14, 0, Math.PI * 2); ctx.stroke();
-      ctx.strokeStyle = i === 0 ? COL.primary : COL.cyanPri; ctx.lineWidth = 1;
+      ctx.strokeStyle = colInner; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.arc(ptx, pty, 7, 0, Math.PI * 2); ctx.stroke();
       ctx.restore();
       // Label
@@ -1574,6 +1816,11 @@
     // bugs
     if (window.BugSystem && state.bugs.length > 0) {
       window.BugSystem.renderAll(ctx, state.bugs, cam, H, frameTick);
+    }
+
+    // danglies
+    if (window.DanglySystem && state.danglies.length > 0) {
+      window.DanglySystem.renderAll(ctx, state.danglies, cam, H, frameTick);
     }
 
     // reflectors
@@ -1721,19 +1968,120 @@
       ctx.restore();
     }
 
-    // fish boss sprite + HP bar
+    // fish boss — procedural wobbly eye (pixelly jelly-bug style)
     if (state.fish.spawned) {
-      const fSize = 36, fx = state.fish.x - cam, fy = H - state.fish.y;
-      ctx.save(); ctx.translate(fx, fy); ctx.rotate(-state.fish.rotation);
-      ctx.shadowColor = 'rgba(255,51,51,0.5)'; ctx.shadowBlur = 16; ctx.imageSmoothingEnabled = false;
-      const fImg = assets['evil_fish_eye'];
-      if (fImg && fImg.complete) ctx.drawImage(fImg, -fSize / 2, -fSize / 2, fSize, fSize);
-      else { ctx.fillStyle = COL.red; ctx.fillRect(-fSize / 2, -fSize / 2, fSize, fSize); }
-      ctx.imageSmoothingEnabled = true; ctx.shadowBlur = 0; ctx.restore();
+      const fx = state.fish.x - cam, fy = H - state.fish.y;
+      const t = frameTick * 0.12;
+      const sp = state.fishShootPulse;
+      const shootT = sp / 18;
+      const shootBulge = Math.sin(shootT * Math.PI) * 0.3;
 
-      // HP bar above the fish
+      const pulse = Math.sin(t) * 0.12;
+      const pulse2 = Math.sin(t * 1.7 + 1.0) * 0.08;
+      const sxF = 1.0 + pulse + shootBulge;
+      const syF = 1.0 - pulse * 0.5 + pulse2 + shootBulge * 0.6;
+
+      const ew = 32, eh = 26;
+      const px = 2;
+
+      ctx.save();
+      ctx.translate(fx, fy);
+      ctx.scale(sxF, syF);
+      ctx.imageSmoothingEnabled = false;
+
+      const glowStr = 0.35 + shootBulge * 0.8;
+      ctx.shadowColor = `rgba(255,51,51,${glowStr.toFixed(2)})`;
+      ctx.shadowBlur = 10 + shootBulge * 18;
+
+      // sclera — stacked rects forming a diamond/eye shape
+      const r1 = Math.floor(190 + Math.sin(t * 0.7) * 35 + shootBulge * 55);
+      const g1 = Math.floor(35 + Math.sin(t * 1.3) * 15 - shootBulge * 25);
+      ctx.fillStyle = `rgb(${r1},${g1},${g1})`;
+      ctx.fillRect(-ew * 0.25, -eh / 2, ew * 0.5, px);
+      ctx.fillRect(-ew * 0.38, -eh / 2 + px, ew * 0.76, px);
+      ctx.fillRect(-ew / 2, -eh / 2 + px * 2, ew, eh - px * 4);
+      ctx.fillRect(-ew * 0.38, eh / 2 - px * 2, ew * 0.76, px);
+      ctx.fillRect(-ew * 0.25, eh / 2 - px, ew * 0.5, px);
+
+      ctx.shadowBlur = 0;
+
+      // vein detail rects
+      const vr = Math.floor(150 + Math.sin(t * 2.3) * 30);
+      ctx.fillStyle = `rgba(${vr},15,15,0.3)`;
+      const vox1 = Math.floor(Math.sin(t * 1.2) * 2);
+      const voy1 = Math.floor(Math.cos(t * 0.9) * 1);
+      ctx.fillRect(-ew / 2 + px + vox1, -px + voy1, px, px);
+      ctx.fillRect(ew / 2 - px * 2 - vox1, px + voy1, px, px);
+      ctx.fillRect(-ew / 2 + px * 2 - voy1, -eh / 2 + px * 2 + vox1, px, px);
+      ctx.fillRect(ew / 2 - px * 3 + voy1, eh / 2 - px * 3 - vox1, px, px);
+      ctx.fillRect(-px * 3 + vox1, -eh / 2 + px * 2, px, px);
+      ctx.fillRect(px * 2 - vox1, eh / 2 - px * 3, px, px);
+
+      // iris — inner colored block that wobbles
+      const iw = Math.floor(14 + shootBulge * 4);
+      const ih = Math.floor(12 + shootBulge * 3);
+      const iwx = Math.floor(Math.sin(t * 1.5) * 2);
+      const iwy = Math.floor(Math.cos(t * 1.8) * 1.5);
+      const iR2 = Math.floor(170 + shootBulge * 60);
+      ctx.fillStyle = `rgb(${iR2},20,0)`;
+      ctx.fillRect(-iw / 2 + iwx, -ih / 2 + iwy, iw, ih);
+
+      // iris inner sub-blocks (like the bug's inner pulse rects)
+      const innerPulse = Math.sin(t * 2.3) * 0.4 + 0.5;
+      ctx.fillStyle = `rgba(255,60,0,${(0.15 + innerPulse * 0.15).toFixed(2)})`;
+      const sox = Math.floor(Math.sin(t * 1.8) * 1.5);
+      const soy = Math.floor(Math.cos(t * 2.1) * 1);
+      ctx.fillRect(-iw * 0.2 + iwx + sox, -ih * 0.2 + iwy + soy, iw * 0.35, ih * 0.35);
+      ctx.fillRect(iwx - sox, iwy - soy + 1, iw * 0.25, ih * 0.25);
+
+      // iris border
+      const g2 = Math.floor(60 + Math.sin(t * 0.7) * 20);
+      ctx.strokeStyle = `rgb(${g2},5,0)`;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(-iw / 2 + iwx, -ih / 2 + iwy, iw, ih);
+
+      // pupil — small dark block, contracts on shoot, tracks player
+      const pw = Math.max(px, Math.floor(6 - shootBulge * 3));
+      const ph = Math.max(px, Math.floor(6 - shootBulge * 2));
+      const lookAngle = state.fish.rotation || 0;
+      const lookDist = 2 + Math.sin(t * 0.8) * 0.5;
+      const pupX = Math.floor(iwx + Math.cos(lookAngle) * lookDist);
+      const pupY = Math.floor(iwy - Math.sin(lookAngle) * lookDist);
+      ctx.fillStyle = '#0a0000';
+      ctx.fillRect(pupX - pw / 2, pupY - ph / 2, pw, ph);
+
+      // specular highlight pixel
+      ctx.fillStyle = `rgba(255,200,180,${(0.5 + Math.sin(t * 1.1) * 0.15).toFixed(2)})`;
+      ctx.fillRect(pupX - pw / 2 - 1, pupY - ph / 2 - 1, px, px);
+
+      // outer border
+      const br = Math.floor(100 + Math.sin(t * 0.6) * 25);
+      ctx.strokeStyle = `rgb(${br},8,8)`;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(-ew / 2, -eh / 2 + px * 2, ew, eh - px * 4);
+
+      // shoot flash — expanding pixel ring
+      if (sp > 0) {
+        const flashAlpha = shootT * 0.6;
+        const flashOff = Math.floor((1 - shootT) * 6);
+        ctx.fillStyle = `rgba(255,100,50,${flashAlpha.toFixed(2)})`;
+        ctx.fillRect(-ew / 2 - px - flashOff, -px, px, px * 2);
+        ctx.fillRect(ew / 2 + flashOff, -px, px, px * 2);
+        ctx.fillRect(-px, -eh / 2 - px - flashOff, px * 2, px);
+        ctx.fillRect(-px, eh / 2 + flashOff, px * 2, px);
+        ctx.fillRect(-ew / 2 + px - flashOff, -eh / 2 + px - flashOff, px, px);
+        ctx.fillRect(ew / 2 - px + flashOff, -eh / 2 + px - flashOff, px, px);
+        ctx.fillRect(-ew / 2 + px - flashOff, eh / 2 - px + flashOff, px, px);
+        ctx.fillRect(ew / 2 - px + flashOff, eh / 2 - px + flashOff, px, px);
+      }
+
+      ctx.imageSmoothingEnabled = true;
+      ctx.restore();
+
+      // HP bar above the eye
       const fhpW = 30, fhpH = 3;
-      const fhpX = fx - fhpW / 2, fhpY = fy - fSize / 2 - 8;
+      const barYOff = (eh / 2) * syF + 8;
+      const fhpX = fx - fhpW / 2, fhpY = fy - barYOff - fhpH;
       ctx.fillStyle = COL.bgPanel; ctx.fillRect(fhpX, fhpY, fhpW, fhpH);
       ctx.fillStyle = COL.redDim;
       ctx.fillRect(fhpX, fhpY, fhpW * Math.max(0, state.fishHP / state.fishMaxHP), fhpH);
@@ -1750,6 +2098,65 @@
       if (p.type === 'blue') { ctx.beginPath(); ctx.arc(ppx + pSize / 2, ppy + pSize / 2, pSize / 2, 0, Math.PI * 2); ctx.fill(); }
       else ctx.fillRect(ppx, ppy, pSize, pSize);
       ctx.shadowBlur = 0; ctx.restore();
+    }
+
+    // hit particles — pixelly squares that fade out
+    for (const pt of state.particles) {
+      const alpha = pt.life / pt.maxLife;
+      const ptx = pt.x - cam - pt.size / 2, pty = H - pt.y - pt.size / 2;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.shadowColor = pt.color; ctx.shadowBlur = 4 * alpha;
+      ctx.fillStyle = pt.color;
+      ctx.fillRect(Math.floor(ptx), Math.floor(pty), pt.size, pt.size);
+      ctx.restore();
+    }
+
+    // ice shards — glowing cyan diamond
+    for (const s of state.iceShards) {
+      const sx = s.x - cam, sy = H - s.y;
+      ctx.save();
+      ctx.translate(sx, sy);
+      ctx.rotate(Math.atan2(s.vy, s.vx));
+      ctx.shadowColor = 'rgba(0,255,204,0.7)'; ctx.shadowBlur = 12;
+      ctx.fillStyle = COL.cyan;
+      ctx.beginPath();
+      ctx.moveTo(8, 0); ctx.lineTo(0, -3); ctx.lineTo(-4, 0); ctx.lineTo(0, 3);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#ffffff'; ctx.globalAlpha = 0.6;
+      ctx.beginPath();
+      ctx.moveTo(6, 0); ctx.lineTo(1, -1.5); ctx.lineTo(-1, 0); ctx.lineTo(1, 1.5);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+
+    // laser beams — bright red streak
+    for (const l of state.laserBeams) {
+      const lx = l.x - cam, ly = H - l.y;
+      const alpha = Math.min(1, l.life / 15);
+      ctx.save(); ctx.globalAlpha = alpha;
+      ctx.shadowColor = 'rgba(255,50,50,0.7)'; ctx.shadowBlur = 10;
+      ctx.strokeStyle = COL.red; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(lx - l.vx * 2, ly); ctx.lineTo(lx, ly); ctx.stroke();
+      ctx.strokeStyle = '#ff8888'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(lx - l.vx * 2, ly); ctx.lineTo(lx, ly); ctx.stroke();
+      ctx.restore();
+    }
+
+    // frozen ring around bugs when frozen
+    if (state.bugsFrozen > 0) {
+      for (const b of state.bugs) {
+        const bx = b.x + 7 - cam, by = H - b.y - 6;
+        ctx.save();
+        ctx.strokeStyle = COL.cyan; ctx.lineWidth = 1.5;
+        ctx.shadowColor = 'rgba(0,255,204,0.5)'; ctx.shadowBlur = 8;
+        ctx.globalAlpha = 0.4 + Math.sin(frameTick * 0.15) * 0.3;
+        ctx.beginPath(); ctx.arc(bx, by, 12, 0, Math.PI * 2); ctx.stroke();
+        ctx.font = '8px ' + FONT_MONO; ctx.fillStyle = COL.cyan; ctx.textAlign = 'center';
+        ctx.fillText('\u2744', bx, by - 14);
+        ctx.textAlign = 'left';
+        ctx.restore();
+      }
     }
 
     drawHUD();
@@ -2098,6 +2505,10 @@
     }
 
     // leaderboard panel — sits to the side if there's space, otherwise below the menu
+    // Compact menu draws instruction lines at footBase-34 / footBase-20 (8px font) — reserve space so the panel
+    // ends above that block (baselines minus ascent, plus a gap).
+    const menuLbBottomReserve = compact ? padY + 34 + 12 + 10 : 50;
+
     if (DREAMLO_PUBLIC) {
       const menuRight = (W + rowW) / 2;
       const sideSpace = W - menuRight - padX - 50;
@@ -2109,14 +2520,20 @@
         const gap = W - padX - menuRight;
         lbX = menuRight + (gap - lbW) / 2;
         lbY = titleY - 10;
-        lbH = Math.min(H - lbY - 60, 340);
+        lbH = Math.min(H - lbY - (compact ? menuLbBottomReserve : 60), 340);
       } else {
         lbW = Math.min(rowW, W - 2 * padX - 20);
         lbX = (W - lbW) / 2;
         const lastRow = layout.length > 0 ? layout[layout.length - 1] : null;
-        const menuBottom = lastRow ? lastRow.y - scrollY + 44 : titleY + 120;
+        const lastRowScreenY = lastRow ? lastRow.y - scrollY : titleY + 120;
+        // Leave room below last row; if cheat warning is shown, start LB under both lines (they sit at +48 / +66).
+        let menuBottom = lastRowScreenY + 44;
+        if (hasCheatsEnabled()) {
+          const warnBlockBottom = lastRowScreenY + 48 + 18 + 10;
+          menuBottom = Math.max(menuBottom, warnBlockBottom);
+        }
         lbY = menuBottom + 12;
-        lbH = Math.min(H - lbY - 50, 180);
+        lbH = Math.min(H - lbY - menuLbBottomReserve, 180);
       }
 
       if (lbW >= 100 && lbH >= 60) {
