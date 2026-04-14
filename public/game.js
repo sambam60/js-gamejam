@@ -1587,6 +1587,7 @@
       if (elapsed > 4000) {
         state.lastBugSpawn = BS.maybeSpawn(state.bugs, state.playerX, state.lastBugSpawn, now);
       }
+      state.bugs = state.bugs.filter(b => b.hp > 0);
       const unfrozenBugs = [];
       for (const b of state.bugs) {
         if (b.frozen > 0) { b.frozen--; } else { unfrozenBugs.push(b); }
@@ -1604,6 +1605,7 @@
       if (elapsed > 8000) {
         state.lastDanglySpawn = DS.maybeSpawn(state.danglies, state.playerX, state.lastDanglySpawn, now);
       }
+      state.danglies = state.danglies.filter(d => d.hp > 0);
       const unfrozenDanglies = [];
       for (const d of state.danglies) {
         if (d.frozen > 0) { d.frozen--; } else { unfrozenDanglies.push(d); }
