@@ -1,5 +1,6 @@
 (function () {
   const canvas = document.getElementById('game');
+  const crtCanvas = document.getElementById('crt-overlay');
   const ctx = canvas.getContext('2d');
   const container = document.getElementById('canvas-container');
   const gameWrapper = document.getElementById('game-wrapper');
@@ -9,6 +10,7 @@
   // leaderboard keys — grab free ones at dreamlo.com
   const DREAMLO_PRIVATE = '9fabDNnmmUufX_-XHl0eMQ5Rz-jJwYBEirxhcAQEpRZg';
   const DREAMLO_PUBLIC  = '69dd567a8f40bc2f605dff31';
+  const CRT_PREF_KEY = 'shapescape_crt_enabled';
 
   // colours and fonts — green terminal look, red for damage, amber for warnings
   const FONT_DISPLAY = '"Redaction 35", Georgia, serif';
@@ -45,6 +47,7 @@
   // background stars — parallax scrolling
   let starPositions = [];
   let frameTick = 0;
+  let crtRenderer = null;
 
   function regenerateStars() {
     starPositions = [];
@@ -74,6 +77,7 @@
     W = cw;
     H = ch;
     regenerateStars();
+    if (crtRenderer) crtRenderer.resize(cw, ch, dpr);
   }
 
   window.addEventListener('resize', resizeCanvas);
@@ -95,16 +99,19 @@
   // load all sprites before starting
   const assets = {};
   const assetList = [
-    'idle_1', 'idle_2', 'idle_3', 'little_gif_guy',
+    'idle_1', 'idle_2', 'idle_2_crouch', 'idle_3', 'little_gif_guy',
+    'crouch_walk_0', 'crouch_walk_1', 'crouch_walk_2', 'crouch_walk_3',
     'coin', 'coin2', 'coin3', 'coin4',
   ];
   let assetsLoaded = 0;
+  const assetSources = {
+    little_gif_guy: 'little_gif_guy.gif',
+  };
 
   function loadAssets(onDone) {
     assetList.forEach(name => {
       const img = new Image();
-      const ext = name === 'little_gif_guy' ? 'gif' : 'png';
-      img.src = name + '.' + ext;
+      img.src = assetSources[name] || (name + '.png');
       img.onload = () => { assetsLoaded++; if (assetsLoaded >= assetList.length) onDone(); };
       img.onerror = () => { assetsLoaded++; if (assetsLoaded >= assetList.length) onDone(); };
       assets[name] = img;
@@ -114,12 +121,16 @@
   // game constants — tweak these to adjust feel
   const CHAR_W = 32;
   const CHAR_H = 32;
+  /** Collision/visual feet-aligned height while crouching (standing uses CHAR_H). */
+  const CHAR_H_CROUCH = 20;
   const GRAVITY = 0.3;
   const MOVE_SPEED = 2;
   const SPRINT_SPEED = 3.6;
+  const CROUCH_SPEED_MULT = 0.6;
   const JUMP_VEL = -6;
   const FISH_SPAWN_DELAY = 120000;
   const idleImages = ['idle_1', 'idle_2', 'idle_3'];
+  const crouchWalkImages = ['crouch_walk_0', 'crouch_walk_1', 'crouch_walk_2', 'crouch_walk_3'];
   const COIN_VALUES = { 1: 1, 2: 5, 3: 10, 4: 15 };
 
   // tools and upgrades
@@ -178,6 +189,8 @@
   const menu = {
     playerName: '',
     nameActive: false,
+    crtEnabled: false,
+    crtSupported: false,
     cheats: {},
     selectedIndex: 0,
     expanded: {},
@@ -192,8 +205,43 @@
   for (const k of ALL_CHEAT_KEYS) menu.cheats[k] = false;
   for (const cat of CHEAT_CATEGORIES) menu.expanded[cat.id] = false;
 
+  function loadCrtPreference() {
+    try {
+      return localStorage.getItem(CRT_PREF_KEY) !== '0';
+    } catch (err) {
+      return true;
+    }
+  }
+
+  function saveCrtPreference(enabled) {
+    try {
+      localStorage.setItem(CRT_PREF_KEY, enabled ? '1' : '0');
+    } catch (err) {}
+  }
+
+  function applyCrtMode() {
+    const enabled = !!menu.crtEnabled;
+    const hasWebglCrt = !!crtRenderer;
+    container.classList.toggle('crt-on', enabled);
+    container.classList.toggle('crt-webgl', hasWebglCrt);
+    if (crtRenderer) crtRenderer.setEnabled(enabled);
+  }
+
+  if (window.CRTPostProcess && crtCanvas) {
+    try {
+      const renderer = new window.CRTPostProcess(canvas, crtCanvas);
+      if (renderer.supported) crtRenderer = renderer;
+    } catch (err) {
+      crtRenderer = null;
+    }
+  }
+  menu.crtSupported = !!crtRenderer;
+  menu.crtEnabled = menu.crtSupported && loadCrtPreference();
+  applyCrtMode();
+  if (crtRenderer) resizeCanvas();
+
   function getMenuItems() {
-    const items = ['start', 'name'];
+    const items = ['start', 'name', 'crt'];
     for (const cat of CHEAT_CATEGORIES) {
       items.push('cat_' + cat.id);
       if (menu.expanded[cat.id]) {
@@ -333,7 +381,8 @@
       phase: 'menu',
       playerX: 50, playerY: 0, playerVY: 0,
       onGround: true, airJumpsUsed: 0,
-      movingLeft: false, movingRight: false, sprinting: false,
+      movingLeft: false, movingRight: false, sprinting: false, crouching: false,
+      mobileCrouch: false, mobileSprintHeld: false, mobileJumpHeld: false,
       direction: 'right',
       idleImg: idleImages[Math.floor(Math.random() * 3)],
       cameraX: 0,
@@ -383,12 +432,58 @@
 
   state = freshState();
 
+  function isSprintActive() {
+    return (state.sprinting || state.mobileSprintHeld) && state.activeUpgrades.sprint;
+  }
+
+  function pauseGameplay() {
+    if (state.phase !== 'playing') return;
+    state.phase = 'paused';
+    state.pauseStart = Date.now();
+    state.movingLeft = false;
+    state.movingRight = false;
+    state.sprinting = false;
+    state.mobileSprintHeld = false;
+    state.mobileCrouch = false;
+    state.mobileJumpHeld = false;
+  }
+
+  function resumeFromPause() {
+    if (state.phase !== 'paused') return;
+    const pausedMs = Date.now() - state.pauseStart;
+    state.gameStartTime += pausedMs;
+    state.lastCoinSpawn += pausedMs;
+    state.lastHeartSpawn += pausedMs;
+    state.lastUpgradeSpawn += pausedMs;
+    state.lastBugSpawn += pausedMs;
+    state.lastDanglySpawn += pausedMs;
+    if (state.fish.lastShot) state.fish.lastShot += pausedMs;
+    if (state.fishRespawnTime > 0) state.fishRespawnTime += pausedMs;
+    state.phase = 'playing';
+  }
+
+  function quitToMenuFromPause() {
+    if (state.phase !== 'paused') return;
+    state.phase = 'menu';
+  }
+
+  function tryDashFromDirection(dirSign) {
+    if (state.phase !== 'playing') return;
+    if (!state.activeUpgrades.dash || state.dashCooldown > 0) return;
+    state.dashActive = 8;
+    state.dashCooldown = 60;
+    if (dirSign < 0) state.direction = 'left';
+    else if (dirSign > 0) state.direction = 'right';
+  }
+
   function getCurrentTool() {
     return state.inventory[state.selectedSlot] || 'square';
   }
 
   // keyboard input
   const keys = {};
+  const DOUBLE_TAP_MS = 280;
+  let lastKeyDirDoubleTap = { side: null, t: 0 };
 
   window.addEventListener('keydown', e => {
     if (e.repeat && state.phase !== 'menu') return;
@@ -424,28 +519,17 @@
     }
 
     if (state.phase === 'playing' && e.code === 'Escape') {
-      state.phase = 'paused';
-      state.pauseStart = Date.now();
-      state.movingLeft = false; state.movingRight = false; state.sprinting = false;
+      pauseGameplay();
       e.preventDefault(); return;
     }
 
     if (state.phase === 'paused') {
       if (e.code === 'Escape' || e.code === 'Enter' || e.code === 'Space') {
-        const pausedMs = Date.now() - state.pauseStart;
-        state.gameStartTime += pausedMs;
-        state.lastCoinSpawn += pausedMs;
-        state.lastHeartSpawn += pausedMs;
-        state.lastUpgradeSpawn += pausedMs;
-        state.lastBugSpawn += pausedMs;
-        state.lastDanglySpawn += pausedMs;
-        if (state.fish.lastShot) state.fish.lastShot += pausedMs;
-        if (state.fishRespawnTime > 0) state.fishRespawnTime += pausedMs;
-        state.phase = 'playing';
+        resumeFromPause();
         e.preventDefault(); return;
       }
       if (e.code === 'KeyQ') {
-        state.phase = 'menu';
+        quitToMenuFromPause();
         e.preventDefault(); return;
       }
       return;
@@ -453,13 +537,32 @@
 
     if (state.phase === 'playing') {
       if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') { tryJump(); e.preventDefault(); }
-      if (e.code === 'ArrowLeft' || e.code === 'KeyA') { state.movingLeft = true; e.preventDefault(); }
-      if (e.code === 'ArrowRight' || e.code === 'KeyD') { state.movingRight = true; e.preventDefault(); }
-      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') state.sprinting = true;
-      if (e.code === 'KeyE' && state.activeUpgrades.dash && state.dashCooldown <= 0) {
-        state.dashActive = 8;
-        state.dashCooldown = 60;
+      if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+        const now = Date.now();
+        if (lastKeyDirDoubleTap.side === 'left' && now - lastKeyDirDoubleTap.t < DOUBLE_TAP_MS) {
+          tryDashFromDirection(-1);
+          lastKeyDirDoubleTap = { side: null, t: 0 };
+        } else {
+          lastKeyDirDoubleTap = { side: 'left', t: now };
+        }
+        state.movingLeft = true;
+        e.preventDefault();
       }
+      if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+        const now = Date.now();
+        if (lastKeyDirDoubleTap.side === 'right' && now - lastKeyDirDoubleTap.t < DOUBLE_TAP_MS) {
+          tryDashFromDirection(1);
+          lastKeyDirDoubleTap = { side: null, t: 0 };
+        } else {
+          lastKeyDirDoubleTap = { side: 'right', t: now };
+        }
+        state.movingRight = true;
+        e.preventDefault();
+      }
+      if (e.code === 'KeyS' || e.code === 'ArrowDown' || e.code === 'ControlLeft' || e.code === 'ControlRight' || e.code === 'KeyC') {
+        e.preventDefault();
+      }
+      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') state.sprinting = true;
 
       // Inventory slot keys 1-9
       const num = parseInt(e.key);
@@ -487,6 +590,14 @@
 
   function activateMenuItem(item) {
     if (item === 'name') { menu.nameActive = true; return; }
+    if (item === 'crt') {
+      if (!menu.crtSupported) return;
+      menu.crtEnabled = !menu.crtEnabled;
+      saveCrtPreference(menu.crtEnabled);
+      applyCrtMode();
+      triggerGlitch();
+      return;
+    }
     if (item.startsWith('cat_')) {
       const catId = item.slice(4);
       menu.expanded[catId] = !menu.expanded[catId];
@@ -514,6 +625,29 @@
     return { x: (clientX - rect.left) * (W / rect.width), y: (clientY - rect.top) * (H / rect.height) };
   }
 
+  function getPausePanelRect() {
+    const w = Math.min(360, W - 40), h = 180;
+    return { x: (W - w) / 2, y: (H - h) / 2, w, h };
+  }
+
+  /** Same breakpoint as `#mobile-controls` in style.css — touch / narrow viewports. */
+  function isMobilePauseHints() {
+    try {
+      return window.matchMedia('(pointer: coarse), (max-width: 600px)').matches;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function handlePauseScreenPointer(clientX, clientY) {
+    if (state.phase !== 'paused') return;
+    const sc = screenCoords(clientX, clientY);
+    const r = getPausePanelRect();
+    const inside = sc.x >= r.x && sc.x <= r.x + r.w && sc.y >= r.y && sc.y <= r.y + r.h;
+    if (inside) quitToMenuFromPause();
+    else resumeFromPause();
+  }
+
   canvas.addEventListener('mousemove', e => {
     mouseOnCanvas = true;
     mouseWorld = canvasCoords(e.clientX, e.clientY);
@@ -526,6 +660,11 @@
     mouseHeld = true;
     if (state.phase === 'menu') { handleMenuClick(e); return; }
     if (state.phase === 'gameover') { state.phase = 'menu'; return; }
+    if (state.phase === 'paused') {
+      handlePauseScreenPointer(e.clientX, e.clientY);
+      e.preventDefault();
+      return;
+    }
     if (state.phase !== 'playing') return;
 
     const tool = getCurrentTool();
@@ -569,6 +708,11 @@
       return;
     }
     if (state.phase === 'gameover') { state.phase = 'menu'; return; }
+    if (state.phase === 'paused' && e.touches.length) {
+      const t = e.touches[0];
+      handlePauseScreenPointer(t.clientX, t.clientY);
+      return;
+    }
     if (state.phase !== 'playing' || !e.touches.length) return;
     const t = e.touches[0];
     const tool = getCurrentTool();
@@ -790,7 +934,7 @@
   function activateGrapple(worldPos) {
     if (state.grappleCooldown > 0) return;
     const pcx = state.playerX + CHAR_W / 2;
-    const pcy = -state.playerY + CHAR_H / 2;
+    const pcy = -state.playerY + playerHitH() / 2;
     let hitShape = null;
     for (const s of state.squares) {
       if (worldPos.x >= s.x && worldPos.x <= s.x + s.width &&
@@ -817,7 +961,7 @@
   function placeReflector(worldPos) {
     if (state.reflectorCooldown > 0) return;
     if (state.reflectors.length >= 3) state.reflectors.shift();
-    const angle = Math.atan2(worldPos.y - (-state.playerY + CHAR_H / 2), worldPos.x - (state.playerX + CHAR_W / 2));
+    const angle = Math.atan2(worldPos.y - (-state.playerY + playerHitH() / 2), worldPos.x - (state.playerX + CHAR_W / 2));
     state.reflectors.push({ x: worldPos.x, y: worldPos.y, angle });
     state.reflectorCooldown = 30;
   }
@@ -831,7 +975,7 @@
   function activateFreeze(target) {
     if (state.freezeCooldown > 0) return;
     const pcx = state.playerX + CHAR_W / 2;
-    const pcy = -state.playerY + CHAR_H / 2;
+    const pcy = -state.playerY + playerHitH() / 2;
     const dx = target.x - pcx, dy = target.y - pcy;
     const dist = Math.sqrt(dx * dx + dy * dy) || 1;
     state.iceShards.push({ x: pcx, y: pcy, vx: (dx / dist) * 5, vy: (dy / dist) * 5, life: 120 });
@@ -841,7 +985,7 @@
   function fireLaser(target) {
     if (state.laserCooldown > 0) return;
     const pcx = state.playerX + CHAR_W / 2;
-    const pcy = -state.playerY + CHAR_H / 2;
+    const pcy = -state.playerY + playerHitH() / 2;
     const dx = target.x - pcx, dy = target.y - pcy;
     const dist = Math.sqrt(dx * dx + dy * dy) || 1;
     state.laserBeams.push({ x: pcx, y: pcy, vx: (dx / dist) * 8, vy: (dy / dist) * 8, life: 60 });
@@ -878,8 +1022,31 @@
   const btnLeft = document.getElementById('btn-left');
   const btnRight = document.getElementById('btn-right');
   const btnJump = document.getElementById('btn-jump');
+  const btnPause = document.getElementById('btn-pause');
+  const btnSprint = document.getElementById('btn-sprint');
+  const btnCrouch = document.getElementById('btn-crouch');
+
+  let lastMobileLeftTap = 0;
+  let lastMobileRightTap = 0;
+  function touchDirDoubleTap(isLeft) {
+    const now = Date.now();
+    if (isLeft) {
+      if (now - lastMobileLeftTap < DOUBLE_TAP_MS) {
+        tryDashFromDirection(-1);
+        lastMobileLeftTap = 0;
+      } else {
+        lastMobileLeftTap = now;
+      }
+    } else if (now - lastMobileRightTap < DOUBLE_TAP_MS) {
+      tryDashFromDirection(1);
+      lastMobileRightTap = 0;
+    } else {
+      lastMobileRightTap = now;
+    }
+  }
 
   function mobileBtn(btn, onDown, onUp) {
+    if (!btn) return;
     btn.addEventListener('touchstart', e => { e.preventDefault(); onDown(); }, { passive: false });
     btn.addEventListener('touchend', e => { e.preventDefault(); onUp(); }, { passive: false });
     btn.addEventListener('touchcancel', e => { e.preventDefault(); onUp(); }, { passive: false });
@@ -887,9 +1054,44 @@
     btn.addEventListener('mouseup', onUp);
     btn.addEventListener('mouseleave', onUp);
   }
-  mobileBtn(btnLeft, () => { if (state.phase === 'playing') state.movingLeft = true; }, () => { state.movingLeft = false; });
-  mobileBtn(btnRight, () => { if (state.phase === 'playing') state.movingRight = true; }, () => { state.movingRight = false; });
-  mobileBtn(btnJump, () => { tryJump(); }, () => {});
+
+  function mobileBtnPlaying(btn, onDown, onUp) {
+    if (!btn) return;
+    const down = () => {
+      if (state.phase === 'paused') { resumeFromPause(); return; }
+      onDown();
+    };
+    mobileBtn(btn, down, onUp);
+  }
+
+  function mobileTap(btn, handler) {
+    if (!btn) return;
+    const run = e => {
+      if (e.type === 'mousedown' && e.button !== 0) return;
+      e.preventDefault();
+      handler();
+    };
+    btn.addEventListener('touchstart', e => { e.preventDefault(); handler(); }, { passive: false });
+    btn.addEventListener('click', run);
+  }
+
+  mobileBtnPlaying(btnLeft, () => {
+    touchDirDoubleTap(true);
+    if (state.phase === 'playing') state.movingLeft = true;
+  }, () => { state.movingLeft = false; });
+  mobileBtnPlaying(btnRight, () => {
+    touchDirDoubleTap(false);
+    if (state.phase === 'playing') state.movingRight = true;
+  }, () => { state.movingRight = false; });
+  mobileBtnPlaying(btnJump, () => {
+    if (state.phase === 'playing') { state.mobileJumpHeld = true; tryJump(); }
+  }, () => { state.mobileJumpHeld = false; });
+  mobileBtnPlaying(btnSprint, () => { if (state.phase === 'playing') state.mobileSprintHeld = true; }, () => { state.mobileSprintHeld = false; });
+  mobileBtnPlaying(btnCrouch, () => { if (state.phase === 'playing') state.mobileCrouch = true; }, () => { state.mobileCrouch = false; });
+  mobileTap(btnPause, () => {
+    if (state.phase === 'playing') pauseGameplay();
+    else if (state.phase === 'paused') resumeFromPause();
+  });
 
   // start / restart game
   function startGame() {
@@ -915,21 +1117,24 @@
   function tryJump() {
     if (state.phase !== 'playing') return;
     if (state.onGround || state.playerY >= -2) {
+      state.crouching = false;
       state.playerVY = JUMP_VEL; state.onGround = false; state.airJumpsUsed = 0; return;
     }
     if (state.activeUpgrades.wallClimb) {
       const pL = state.playerX, pB = -state.playerY;
       const rects = getCollisionRects();
       let touchingWall = false;
+      const ph = playerHitH();
       for (const s of rects) {
-        if (overlap(pL - 2, pB, 2, CHAR_H, s.x, s.y, s.width, s.height) ||
-            overlap(pL + CHAR_W, pB, 2, CHAR_H, s.x, s.y, s.width, s.height)) {
+        if (overlap(pL - 2, pB, 2, ph, s.x, s.y, s.width, s.height) ||
+            overlap(pL + CHAR_W, pB, 2, ph, s.x, s.y, s.width, s.height)) {
           touchingWall = true; break;
         }
       }
-      if (touchingWall) { state.playerVY = JUMP_VEL * 0.85; return; }
+      if (touchingWall) { state.crouching = false; state.playerVY = JUMP_VEL * 0.85; return; }
     }
     if (state.activeUpgrades.doubleJump && state.airJumpsUsed < 1) {
+      state.crouching = false;
       state.playerVY = JUMP_VEL; state.airJumpsUsed++;
     }
   }
@@ -939,14 +1144,30 @@
     return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
   }
 
-  function resolveHorizontal(proposedX, bottom, squares, dir) {
+  function playerHitH() {
+    return state.crouching ? CHAR_H_CROUCH : CHAR_H;
+  }
+
+  /** True if the strip above the crouch hitbox (where the head would go when standing) hits level geometry. */
+  function crouchHeadBandBlocked() {
+    const extra = CHAR_H - CHAR_H_CROUCH;
+    if (extra <= 0) return false;
+    const pL = state.playerX, pB = -state.playerY;
+    const bandY = pB + CHAR_H_CROUCH;
+    for (const s of getCollisionRects()) {
+      if (overlap(pL, bandY, CHAR_W, extra, s.x, s.y, s.width, s.height)) return true;
+    }
+    return false;
+  }
+
+  function resolveHorizontal(proposedX, bottom, squares, dir, hitH) {
     if (dir === 0) return proposedX;
     let x = proposedX;
     for (const s of squares) {
-      if (!(bottom < s.y + s.height && bottom + CHAR_H > s.y)) continue;
-      if (dir > 0 && overlap(x, bottom, CHAR_W, CHAR_H, s.x, s.y, s.width, s.height))
+      if (!(bottom < s.y + s.height && bottom + hitH > s.y)) continue;
+      if (dir > 0 && overlap(x, bottom, CHAR_W, hitH, s.x, s.y, s.width, s.height))
         x = Math.min(x, s.x - CHAR_W);
-      else if (dir < 0 && overlap(x, bottom, CHAR_W, CHAR_H, s.x, s.y, s.width, s.height))
+      else if (dir < 0 && overlap(x, bottom, CHAR_W, hitH, s.x, s.y, s.width, s.height))
         x = Math.max(x, s.x + s.width);
     }
     return x;
@@ -1108,14 +1329,15 @@
   }
 
   function ejectPlayerFromShape(shape) {
+    const ph = playerHitH();
     const pL = state.playerX, pB = -state.playerY;
-    if (!overlap(pL, pB, CHAR_W, CHAR_H, shape.x, shape.y, shape.width, shape.height)) return;
+    if (!overlap(pL, pB, CHAR_W, ph, shape.x, shape.y, shape.width, shape.height)) return;
 
     const oldX = state.playerX, oldY = state.playerY;
 
     const toLeft = (pL + CHAR_W) - shape.x;
     const toRight = (shape.x + shape.width) - pL;
-    const toBottom = (pB + CHAR_H) - shape.y;
+    const toBottom = (pB + ph) - shape.y;
     const toTop = (shape.y + shape.height) - pB;
     const min = Math.min(toLeft, toRight, toBottom, toTop);
 
@@ -1124,7 +1346,7 @@
       state.playerVY = 0;
       state.onGround = true;
     } else if (min === toBottom) {
-      state.playerY = -(shape.y - CHAR_H);
+      state.playerY = -(shape.y - ph);
       state.playerVY = 0;
     } else if (min === toLeft) {
       state.playerX = shape.x - CHAR_W;
@@ -1142,7 +1364,7 @@
     }
   }
 
-  function resolveVertical(proposedY, px, squares, vy) {
+  function resolveVertical(proposedY, px, squares, vy, hitH) {
     let y = proposedY, vel = vy, grounded = false;
     const pL = px, pR = px + CHAR_W;
     let bottom = -y;
@@ -1152,7 +1374,7 @@
       let highest = null;
       for (const s of squares) {
         if (!(pL < s.x + s.width && pR > s.x)) continue;
-        if (!overlap(pL, bottom, CHAR_W, CHAR_H, s.x, s.y, s.width, s.height)) continue;
+        if (!overlap(pL, bottom, CHAR_W, hitH, s.x, s.y, s.width, s.height)) continue;
         const top = s.y + s.height;
         if (highest === null || top > highest) highest = top;
       }
@@ -1161,10 +1383,10 @@
       let lowest = null;
       for (const s of squares) {
         if (!(pL < s.x + s.width && pR > s.x)) continue;
-        if (!overlap(pL, bottom, CHAR_W, CHAR_H, s.x, s.y, s.width, s.height)) continue;
+        if (!overlap(pL, bottom, CHAR_W, hitH, s.x, s.y, s.width, s.height)) continue;
         if (lowest === null || s.y < lowest) lowest = s.y;
       }
-      if (lowest !== null) { y = -(lowest - CHAR_H); vel = 0; }
+      if (lowest !== null) { y = -(lowest - hitH); vel = 0; }
     }
     return { y, vy: vel, onGround: grounded };
   }
@@ -1174,6 +1396,12 @@
     if (state.phase !== 'playing' || state.health <= 0) return;
     const now = Date.now();
 
+    const wantCrouch = !!(state.mobileCrouch || keys['KeyS'] || keys['ArrowDown'] || keys['ControlLeft'] || keys['ControlRight'] || keys['KeyC']);
+    const canCrouch = state.onGround || state.playerY >= -2;
+    if (!canCrouch) state.crouching = false;
+    else if (wantCrouch) state.crouching = true;
+    else if (state.crouching && !crouchHeadBandBlocked()) state.crouching = false;
+
     let dir = 0;
     if (state.movingLeft) dir = -1;
     else if (state.movingRight) dir = 1;
@@ -1181,10 +1409,13 @@
     else if (dir === 1) state.direction = 'right';
     if (dir !== 0) state.idleImg = idleImages[Math.floor(Math.random() * 3)];
 
-    let speed = (state.sprinting && state.activeUpgrades.sprint) ? SPRINT_SPEED : MOVE_SPEED;
+    let speed = isSprintActive() ? SPRINT_SPEED : MOVE_SPEED;
+    if (state.crouching) speed *= CROUCH_SPEED_MULT;
     if (state.dashActive > 0) { speed = 8; state.dashActive--; }
     if (state.dashCooldown > 0) state.dashCooldown--;
     if (state.damageFlash > 0) state.damageFlash--;
+
+    const pHit = playerHitH();
 
     // grapple pull — override normal gravity while hooked
     let grappleHX = 0;
@@ -1192,7 +1423,7 @@
     if (grappling) {
       const g = state.grapple;
       const gdx = g.tx - (state.playerX + CHAR_W / 2);
-      const gdy = g.ty - (-state.playerY + CHAR_H / 2);
+      const gdy = g.ty - (-state.playerY + pHit / 2);
       const gdist = Math.sqrt(gdx * gdx + gdy * gdy);
       if (gdist > 12) {
         const pullSpeed = Math.min(4.5, 1.5 + gdist * 0.01);
@@ -1206,7 +1437,7 @@
     state.portalBoostVX *= 0.92;
     if (Math.abs(state.portalBoostVX) < 0.05) state.portalBoostVX = 0;
     const hDir = proposedX > state.playerX ? 1 : proposedX < state.playerX ? -1 : dir;
-    const resolvedX = resolveHorizontal(proposedX, -state.playerY, colRects, hDir);
+    const resolvedX = resolveHorizontal(proposedX, -state.playerY, colRects, hDir, pHit);
 
     if (grappling && grappleHX !== 0 && Math.abs(resolvedX - proposedX) > 0.5) {
       state.grapple = null;
@@ -1216,10 +1447,10 @@
     state.playerX = resolvedX;
 
     if (!grappling) state.playerVY += GRAVITY;
-    if (state.activeUpgrades.glide && !state.onGround && state.playerVY > 0 && (keys['Space'] || keys['ArrowUp'] || keys['KeyW'])) {
+    if (state.activeUpgrades.glide && !state.onGround && state.playerVY > 0 && (state.mobileJumpHeld || keys['Space'] || keys['ArrowUp'] || keys['KeyW'])) {
       state.playerVY = Math.min(state.playerVY, 1.0);
     }
-    const vr = resolveVertical(state.playerY + state.playerVY, state.playerX, colRects, state.playerVY);
+    const vr = resolveVertical(state.playerY + state.playerVY, state.playerX, colRects, state.playerVY, pHit);
     state.playerY = vr.y; state.playerVY = vr.vy;
     if (vr.onGround) { state.onGround = true; state.airJumpsUsed = 0; } else state.onGround = false;
 
@@ -1243,12 +1474,12 @@
       const pL2 = state.playerX, pB2 = -state.playerY;
       for (let i = 0; i < 2; i++) {
         const pt = state.portals[i], other = state.portals[1 - i];
-        if (overlap(pL2, pB2, CHAR_W, CHAR_H,
+        if (overlap(pL2, pB2, CHAR_W, pHit,
                     pt.x - PORTAL_HIT_W / 2, pt.y - PORTAL_HIT_H / 2,
                     PORTAL_HIT_W, PORTAL_HIT_H)) {
           const entryVX = dir * speed + state.portalBoostVX;
           state.playerX = other.x - CHAR_W / 2;
-          state.playerY = -(other.y - CHAR_H / 2);
+          state.playerY = -(other.y - pHit / 2);
           state.portalBoostVX = entryVX * 1.15;
           spawnHitParticles(pt.x, pt.y, i === 0 ? '#3399ff' : '#ff8c1a');
           spawnHitParticles(other.x, other.y, (1 - i) === 0 ? '#3399ff' : '#ff8c1a');
@@ -1264,7 +1495,7 @@
       state.swordSwing.frame++;
       if (state.swordSwing.frame === 3 && !state.swordSwing.hit) {
         state.swordSwing.hit = true;
-        const pcx = state.playerX + CHAR_W / 2, pcy = -state.playerY + CHAR_H / 2;
+        const pcx = state.playerX + CHAR_W / 2, pcy = -state.playerY + playerHitH() / 2;
         // check fish
         if (state.fish.spawned) {
           const fdx = state.fish.x - pcx, fdy = state.fish.y - pcy;
@@ -1334,19 +1565,20 @@
 
     // collect coins / hearts / upgrades on overlap
     const pL = state.playerX, pB = -state.playerY;
+    const ph = playerHitH();
     state.coins = state.coins.filter(c => {
-      if (overlap(pL, pB, CHAR_W, CHAR_H, c.x - 8, c.y - 8, 16, 16)) { state.score += COIN_VALUES[c.type] || 1; return false; }
+      if (overlap(pL, pB, CHAR_W, ph, c.x - 8, c.y - 8, 16, 16)) { state.score += COIN_VALUES[c.type] || 1; return false; }
       return true;
     });
     state.hearts = state.hearts.filter(h => {
-      if (overlap(pL, pB, CHAR_W, CHAR_H, h.x - 8, h.y - 8, 16, 16)) {
+      if (overlap(pL, pB, CHAR_W, ph, h.x - 8, h.y - 8, 16, 16)) {
         state.health = Math.min(100, state.health + h.heal);
         return false;
       }
       return true;
     });
     state.upgrades = state.upgrades.filter(u => {
-      if (overlap(pL, pB, CHAR_W, CHAR_H, u.x - 8, u.y - 8, 16, 16)) {
+      if (overlap(pL, pB, CHAR_W, ph, u.x - 8, u.y - 8, 16, 16)) {
         const def = UPGRADE_DEFS[u.key];
         if (state.score >= def.cost) {
           state.score -= def.cost;
@@ -1363,7 +1595,7 @@
     // coin magnet upgrade — pull nearby coins toward player
     if (state.activeUpgrades.coinMagnet) {
       const magnetRange = 120;
-      const mcx = state.playerX + CHAR_W / 2, mcy = -state.playerY + CHAR_H / 2;
+      const mcx = state.playerX + CHAR_W / 2, mcy = -state.playerY + ph / 2;
       for (const c of state.coins) {
         const mdx = mcx - c.x, mdy = mcy - c.y;
         const mdist = Math.sqrt(mdx * mdx + mdy * mdy);
@@ -1381,7 +1613,7 @@
     if (state.grapple) {
       const g = state.grapple;
       const gdx = g.tx - (state.playerX + CHAR_W / 2);
-      const gdy = g.ty - (-state.playerY + CHAR_H / 2);
+      const gdy = g.ty - (-state.playerY + playerHitH() / 2);
       if (Math.sqrt(gdx * gdx + gdy * gdy) <= 12) {
         state.playerVY = Math.min(state.playerVY, -2);
         state.grapple = null;
@@ -1506,7 +1738,7 @@
     }
     if (fish.spawned && state.fishFrozen <= 0) {
       fish.speed = Math.min(0.4 + ((elapsed - FISH_SPAWN_DELAY) / 1000) * 0.012, 1.8);
-      const pcx = state.playerX + CHAR_W / 2, pcy = -state.playerY + CHAR_H / 2;
+      const pcx = state.playerX + CHAR_W / 2, pcy = -state.playerY + ph / 2;
       const dx = pcx - fish.x, dy = pcy - fish.y, dist = Math.sqrt(dx * dx + dy * dy);
       let eff = fish.speed;
       if (dist > 300) eff = fish.speed * (1 + (dist - 300) / 200);
@@ -1520,7 +1752,7 @@
         state.fishShootPulse = 18;
       }
       if (fish.touchCd > 0) fish.touchCd--;
-      if (fish.touchCd <= 0 && overlap(pL, pB, CHAR_W, CHAR_H, fish.x - 18, fish.y - 18, 36, 36)) {
+      if (fish.touchCd <= 0 && overlap(pL, pB, CHAR_W, ph, fish.x - 18, fish.y - 18, 36, 36)) {
         applyDamage(15);
         fish.touchCd = 60;
       }
@@ -1563,7 +1795,7 @@
           state.grappleCooldown = 90;
         }
       }
-      if (!p.reflected && overlap(pL, pB, CHAR_W, CHAR_H, plx, pby, ps, ps)) {
+      if (!p.reflected && overlap(pL, pB, CHAR_W, ph, plx, pby, ps, ps)) {
         applyDamage(p.type === 'red' ? 12 : 6);
         spawnHitParticles(p.x, p.y, projColors[p.type]);
         return false;
@@ -1595,7 +1827,7 @@
       if (unfrozenBugs.length > 0) {
         BS.updateAll(unfrozenBugs, state.playerX, pB, state.squares, H, frameTick);
       }
-      const bugDmg = BS.checkPlayerCollision(state.bugs, pL, pB, CHAR_W, CHAR_H);
+      const bugDmg = BS.checkPlayerCollision(state.bugs, pL, pB, CHAR_W, ph);
       if (bugDmg > 0) { applyDamage(bugDmg); }
     }
 
@@ -1613,13 +1845,19 @@
       if (unfrozenDanglies.length > 0) {
         DS.updateAll(unfrozenDanglies, state.playerX, pB, state.squares, H, frameTick);
       }
-      const danglyDmg = DS.checkPlayerCollision(state.danglies, pL, pB, CHAR_W, CHAR_H);
+      const danglyDmg = DS.checkPlayerCollision(state.danglies, pL, pB, CHAR_W, ph);
       if (danglyDmg > 0) { applyDamage(danglyDmg); }
     }
   }
 
   // render — called every frame after update
   let walkFrame = 0, walkTimer = 0;
+  let crouchWalkFrame = 0, crouchWalkTimer = 0;
+
+  function presentCrtFrame() {
+    if (!crtRenderer || !menu.crtEnabled) return;
+    crtRenderer.render(performance.now() * 0.001);
+  }
 
   let lastPlayingClass = false;
   function render() {
@@ -1632,7 +1870,13 @@
     ctx.clearRect(0, 0, W, H);
     frameTick++;
 
-    if (state.phase === 'menu') { fetchLeaderboard(); updateHotbarDOM(); drawMenu(); return; }
+    if (state.phase === 'menu') {
+      fetchLeaderboard();
+      updateHotbarDOM();
+      drawMenu();
+      presentCrtFrame();
+      return;
+    }
 
     const cam = state.cameraX;
     drawSkyAndStars(cam);
@@ -1958,7 +2202,7 @@
     // grapple rope
     if (state.grapple) {
       const g = state.grapple;
-      const gpx = state.playerX + CHAR_W / 2 - cam, gpy = H - (-state.playerY) - CHAR_H / 2;
+      const gpx = state.playerX + CHAR_W / 2 - cam, gpy = H - (-state.playerY) - playerHitH() / 2;
       const gtx = g.tx - cam, gty = H - g.ty;
       ctx.save();
       ctx.strokeStyle = COL.amber; ctx.lineWidth = 2;
@@ -1985,20 +2229,21 @@
 
     // dash afterimage
     if (state.dashActive > 0) {
+      const ph = playerHitH();
       const dtx = state.playerX - cam, dty = H - (-state.playerY) - CHAR_H;
       ctx.save(); ctx.globalAlpha = 0.3;
       ctx.fillStyle = COL.amber;
       for (let di = 1; di <= 3; di++) {
         const off = di * 10 * (state.direction === 'right' ? -1 : 1);
         ctx.globalAlpha = 0.3 - di * 0.08;
-        ctx.fillRect(dtx + off, dty, CHAR_W, CHAR_H);
+        ctx.fillRect(dtx + off, dty + (CHAR_H - ph), CHAR_W, ph);
       }
       ctx.restore();
     }
 
     // glide wing lines above player
-    if (state.activeUpgrades.glide && !state.onGround && state.playerVY > 0 && (keys['Space'] || keys['ArrowUp'] || keys['KeyW'])) {
-      const glx = state.playerX + CHAR_W / 2 - cam, gly = H - (-state.playerY) - CHAR_H - 4;
+    if (state.activeUpgrades.glide && !state.onGround && state.playerVY > 0 && (state.mobileJumpHeld || keys['Space'] || keys['ArrowUp'] || keys['KeyW'])) {
+      const glx = state.playerX + CHAR_W / 2 - cam, gly = H - (-state.playerY) - playerHitH() - 4;
       ctx.save(); ctx.globalAlpha = 0.4;
       ctx.strokeStyle = COL.primary; ctx.lineWidth = 1;
       ctx.beginPath();
@@ -2014,11 +2259,28 @@
     if (state.direction === 'left') { ctx.translate(px + CHAR_W, py); ctx.scale(-1, 1); }
     else ctx.translate(px, py);
     let playerImg;
-    if (isMoving) {
+    if (state.crouching && isMoving) {
+      walkFrame = 0; walkTimer = 0;
+      crouchWalkTimer++;
+      if (crouchWalkTimer > 7) {
+        crouchWalkTimer = 0;
+        crouchWalkFrame = (crouchWalkFrame + 1) % crouchWalkImages.length;
+      }
+      playerImg = assets[crouchWalkImages[crouchWalkFrame]];
+    } else if (state.crouching) {
+      walkFrame = 0; walkTimer = 0;
+      crouchWalkFrame = 0; crouchWalkTimer = 0;
+      playerImg = assets.idle_2_crouch;
+    } else if (isMoving) {
+      crouchWalkFrame = 0; crouchWalkTimer = 0;
       walkTimer++;
-      if (walkTimer > ((state.sprinting && state.activeUpgrades.sprint) ? 5 : 8)) { walkTimer = 0; walkFrame = (walkFrame + 1) % 3; }
+      if (walkTimer > (isSprintActive() ? 5 : 8)) { walkTimer = 0; walkFrame = (walkFrame + 1) % 3; }
       playerImg = assets[idleImages[walkFrame]];
-    } else { playerImg = assets[state.idleImg]; walkFrame = 0; walkTimer = 0; }
+    } else {
+      playerImg = assets[state.idleImg];
+      walkFrame = 0; walkTimer = 0;
+      crouchWalkFrame = 0; crouchWalkTimer = 0;
+    }
     if (playerImg && playerImg.complete) ctx.drawImage(playerImg, 0, 0, CHAR_W, CHAR_H);
     else { ctx.fillStyle = COL.primary; ctx.fillRect(0, 0, CHAR_W, CHAR_H); }
     if (state.damageFlash > 0) {
@@ -2033,7 +2295,7 @@
     if (state.swordSwing && state.swordSwing.frame <= 12) {
       const sw = state.swordSwing;
       const scx = state.playerX + CHAR_W / 2 - cam;
-      const scy = H - (-state.playerY) - CHAR_H / 2;
+      const scy = H - (-state.playerY) - playerHitH() / 2;
       const dirMul = sw.direction === 'right' ? 1 : -1;
       const progress = sw.frame / 12;
       const baseAngle = sw.direction === 'right' ? -Math.PI / 3 : Math.PI + Math.PI / 3;
@@ -2328,17 +2590,28 @@
       ctx.fillStyle = COL.bright; ctx.font = 'bold 28px ' + FONT_DISPLAY; ctx.textAlign = 'center';
       ctx.fillText('PAUSED', W / 2, panelY + 74); ctx.restore();
 
-      ctx.font = '12px ' + FONT_MONO; ctx.textAlign = 'center';
-      ctx.fillStyle = COL.mid;
-      ctx.fillText('ESC / ENTER / SPACE  \u2500  RESUME', W / 2, panelY + 115);
-      ctx.fillStyle = COL.dim;
-      ctx.fillText('Q  \u2500  QUIT TO MENU', W / 2, panelY + 140);
+      const hintPx = W < 360 ? 9 : W < 480 ? 10 : 12;
+      ctx.font = hintPx + 'px ' + FONT_MONO;
+      ctx.textAlign = 'center';
+      if (isMobilePauseHints()) {
+        ctx.fillStyle = COL.mid;
+        ctx.fillText('OUTSIDE / ESC / \u2630  \u2500  RESUME', W / 2, panelY + 115);
+        ctx.fillStyle = COL.dim;
+        ctx.fillText('TAP BOX  \u2500  MAIN MENU', W / 2, panelY + 138);
+      } else {
+        ctx.fillStyle = COL.mid;
+        ctx.fillText('OUTSIDE / ESC / ENTER / SPACE  \u2500  RESUME', W / 2, panelY + 115);
+        ctx.fillStyle = COL.dim;
+        ctx.fillText('PANEL / Q  \u2500  MAIN MENU', W / 2, panelY + 138);
+      }
 
       const elapsed = Math.floor((state.pauseStart - state.gameStartTime) / 1000);
       ctx.fillStyle = COL.shadow; ctx.font = '10px ' + FONT_MONO;
       ctx.fillText('T+' + String(Math.floor(elapsed / 60)).padStart(2, '0') + ':' + String(elapsed % 60).padStart(2, '0') + '  \u2502  SCORE: ' + state.score, W / 2, panelY + 168);
       ctx.textAlign = 'left';
     }
+
+    presentCrtFrame();
   }
 
   // HUD — health bar, score, active upgrade tags, timer, coords
@@ -2374,6 +2647,11 @@
     ctx.fillText(String(state.score), scoreX + 52, y + 10); ctx.restore();
 
     let tagX = scoreX + 52 + ctx.measureText(String(state.score)).width + 16;
+    let tagY = y;
+    const tagGap = 16;
+    const tagLineH = 15;
+    const tagRightPad = 10;
+    const tagWrapX = x;
     ctx.font = '9px ' + FONT_MONO;
     const tags = [
       ['doubleJump', '2xJUMP', COL.cyanPri, COL.cyan],
@@ -2387,7 +2665,14 @@
       ['reinforce', 'REINF', COL.dim, COL.primary],
     ];
     for (const [key, label, bc, tc] of tags) {
-      if (state.activeUpgrades[key]) { drawTag(tagX, y, label, bc, tc); tagX += ctx.measureText(label).width + 16; }
+      if (!state.activeUpgrades[key]) continue;
+      const tw = ctx.measureText(label).width + 8;
+      if (tagX + tw > W - tagRightPad) {
+        tagX = tagWrapX;
+        tagY += tagLineH;
+      }
+      drawTag(tagX, tagY, label, bc, tc);
+      tagX += ctx.measureText(label).width + tagGap;
     }
 
     ctx.fillStyle = COL.shadow; ctx.font = '9px ' + FONT_MONO;
@@ -2501,6 +2786,7 @@
       const row = layout[i], selected = i === menu.selectedIndex, item = items[i];
       const isCat = item.startsWith('cat_');
       const isCheat = item.startsWith('cheat_');
+      const labelX = colL + (selected ? 12 : 0);
       const isSmall = isCheat;
       const rowH = isSmall ? 20 : 32;
       const rowHalf = rowH / 2;
@@ -2541,7 +2827,7 @@
         const onCount = cat.keys.filter(k => menu.cheats[k]).length;
         ctx.fillStyle = selected ? COL.bright : cc.pri;
         ctx.font = (rowW < 280 ? '11px ' : '13px ') + FONT_MONO; ctx.textAlign = 'left';
-        ctx.fillText(arrow + ' ' + cat.label, colL, row.y + 5);
+        ctx.fillText(arrow + ' ' + cat.label, labelX, row.y + 5);
         ctx.fillStyle = cc.dim; ctx.font = '9px ' + FONT_MONO;
         ctx.fillText(cat.keys.length + ' ITEMS', colMidL, row.y + 5);
         if (onCount > 0) {
@@ -2553,7 +2839,7 @@
         const def = UPGRADE_DEFS[key], on = menu.cheats[key];
         ctx.fillStyle = on ? (selected ? COL.bright : COL.primary) : (selected ? COL.dim : COL.shadow);
         ctx.font = '11px ' + FONT_MONO; ctx.textAlign = 'left';
-        const nameX = colL + (selected ? 10 : 0);
+        const nameX = labelX;
         let label = def.name;
         const maxNameW = rowW - rowPad * 2 - 36;
         while (label.length > 4 && ctx.measureText(label).width > maxNameW) label = label.slice(0, -2) + '\u2026';
@@ -2568,15 +2854,24 @@
         }
       } else if (item === 'name') {
         ctx.fillStyle = textColor; ctx.font = (rowW < 300 ? '12px ' : '14px ') + FONT_MONO; ctx.textAlign = 'left';
-        ctx.fillText('NAME:', colL, row.y + 6);
+        ctx.fillText('NAME:', labelX, row.y + 6);
         const nameVal = menu.playerName || (menu.nameActive ? '' : 'ANONYMOUS');
         ctx.fillStyle = menu.playerName ? textColor : (selected ? COL.dim : COL.shadow);
         const cursorChar = menu.nameActive && frameTick % 50 < 25 ? '\u2588' : '';
         let base = menu.nameActive ? menu.playerName.toUpperCase() : nameVal;
-        const nameStartX = colL + ctx.measureText('NAME: ').width;
+        const nameStartX = labelX + ctx.measureText('NAME: ').width;
         const maxNm = colR - nameStartX;
         while (base.length > 0 && ctx.measureText(base + cursorChar).width > maxNm) base = base.slice(0, -1);
         ctx.fillText(base + cursorChar, nameStartX, row.y + 6);
+      } else if (item === 'crt') {
+        const status = menu.crtSupported ? (menu.crtEnabled ? 'ON' : 'OFF') : 'N/A';
+        const statusCol = !menu.crtSupported ? COL.shadow : (menu.crtEnabled ? COL.bright : COL.dim);
+        ctx.fillStyle = textColor; ctx.font = (rowW < 300 ? '12px ' : '14px ') + FONT_MONO; ctx.textAlign = 'left';
+        ctx.fillText('CRT SHADER', labelX, row.y + 6);
+        ctx.fillStyle = COL.shadow; ctx.font = '9px ' + FONT_MONO;
+        ctx.fillText(menu.crtSupported ? 'WEBGL POST FX' : 'WEBGL NOT SUPPORTED', colMidL, row.y + 5);
+        ctx.fillStyle = statusCol; ctx.font = 'bold 11px ' + FONT_MONO; ctx.textAlign = 'right';
+        ctx.fillText(status, colMidR, row.y + 4);
       }
     }
 
@@ -2714,7 +3009,7 @@
       ctx.fillText('TAP ROW TO SELECT', cx, footBase - 34);
       ctx.fillText('IN GAME: HOTBAR + DRAG TO DRAW / USE TOOLS', cx, footBase - 20);
     } else {
-      ctx.fillText('\u2191\u2193 NAVIGATE    ENTER SELECT    A/D MOVE    SPACE JUMP    SHIFT SPRINT    E DASH    ESC PAUSE', cx, footBase - 36);
+      ctx.fillText('\u2191\u2193 NAVIGATE    ENTER SELECT    A/D MOVE  2xA/D DASH    SPACE JUMP    SHIFT SPRINT    ESC PAUSE', cx, footBase - 36);
       ctx.fillText('1-9 TOOLS    SCROLL CYCLE    CLICK+DRAG PLATFORMS    HOLD JUMP TO GLIDE', cx, footBase - 22);
     }
     ctx.textAlign = 'left';
