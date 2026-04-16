@@ -69,6 +69,23 @@ body {
   min-height: 120px;
 }
 
+#menu-text-input {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  z-index: -1;
+  font-size: 16px;
+  background: transparent;
+  color: transparent;
+  caret-color: transparent;
+}
+
 canvas {
   display: block;
   width: 100%;
@@ -327,3 +344,4 @@ canvas {
 ::-webkit-scrollbar-track { background: #000; }
 ::-webkit-scrollbar-thumb { background: #003300; border: 1px solid #006600; }
 ::-webkit-scrollbar-thumb:hover { background: #006600; }
+

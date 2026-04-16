@@ -45,7 +45,7 @@ Collect coins (worth 1–15 points each), kill bugs (+10), kill the fish (+50). 
 
 ## Assets
 
-- Character sprites: `idle_1/2/3.png` (32×32 pixel art, 3-frame walk cycle)
-- Boss: `evil_fish_eye.png`
+- Character sprites: `idle_1/2/3.png` (32×32 pixel art, 3-frame walk cycle), `idle_2_crouch.png`, `crouch_walk_0..3.png`
+- Boss: rendered procedurally on the canvas (no sprite)
 - Coins: `coin.png` – `coin4.png`
 - Fonts: Berkeley Mono, Redaction 35

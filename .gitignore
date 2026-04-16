@@ -1,2 +1,6 @@
 .DS_Store
 .vercel
+node_modules
+public/multiplayer-bridge.js
+public/multiplayer-bridge.js.map
+.partykit
