@@ -44,7 +44,7 @@ export const PLAYER_GRAPPLE_STRENGTH = 180;
 export const DAMAGE_FLASH_SECONDS = 0.2;      // gj state.damageFlash=12 frames
 export const PLAYER_INVULNERABLE_SECONDS = 0.9; // PvP-only (sim-authored)
 export const PLAYER_RESPAWN_SECONDS = 3;        // co-op respawn (sim-authored)
-export const PLAYER_PVP_RESPAWN_SECONDS = 10;   // PvP respawn (sim-authored)
+export const PLAYER_PVP_RESPAWN_SECONDS = 15;   // PvP respawn (sim-authored)
 export const ARMOR_DAMAGE_MULT = 0.6;         // gj applyDamage(): amount * 0.6 when armor
 
 // ---------------------------------------------------------------------------
@@ -62,6 +62,13 @@ export const HEART_SPAWN_MIN_SECONDS = 20;    // gj 20000ms base
 export const HEART_SPAWN_RANDOM_SECONDS = 15; // gj + random*15000ms
 export const UPGRADE_SPAWN_MIN_SECONDS = 30;  // gj 30000ms base
 export const UPGRADE_SPAWN_RANDOM_SECONDS = 25; // gj + random*25000ms
+// Coop-only revive pickup. Spawned every ~25s (+random) while at least one
+// teammate is dead; picking it up respawns every dead teammate falling from
+// the sky so the party can keep going after a wipe-in-progress.
+export const REVIVE_SPAWN_MIN_SECONDS = 25;
+export const REVIVE_SPAWN_RANDOM_SECONDS = 15;
+export const REVIVE_SPAWN_SPREAD = 500;
+export const REVIVE_SKY_Y = 520;
 // Horizontal spread (±half) of each spawn around the player anchor. gj-matched.
 export const COIN_SPAWN_SPREAD = 600;
 export const HEART_SPAWN_SPREAD = 500;

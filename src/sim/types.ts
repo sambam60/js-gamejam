@@ -256,6 +256,13 @@ export interface SpawnTimers {
   bug: number;
   dangly: number;
   upgrade: number;
+  revive: number;
+}
+
+export interface RevivePickupState {
+  id: string;
+  x: number;
+  y: number;
 }
 
 export interface GameState {
@@ -279,6 +286,7 @@ export interface GameState {
   portals: Record<string, PortalState[]>;
   reflectors: ReflectorState[];
   bombs: BombState[];
+  revives: RevivePickupState[];
   spawnTimers: SpawnTimers;
 }
 

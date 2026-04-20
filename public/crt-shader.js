@@ -239,9 +239,16 @@
       if (!this.supported || !this.enabled) return;
       const gl = this.gl;
 
-      if (this.sourceCanvas.width !== this.texW || this.sourceCanvas.height !== this.texH) {
-        this.texW = this.sourceCanvas.width;
-        this.texH = this.sourceCanvas.height;
+      const srcW = this.sourceCanvas.width | 0;
+      const srcH = this.sourceCanvas.height | 0;
+      // Browsers throw "INVALID_VALUE: texSubImage2D: no canvas" when the source
+      // canvas has zero dimensions (e.g. container not yet laid out on first frame).
+      if (srcW <= 0 || srcH <= 0) return;
+      if (this.outputCanvas.width <= 0 || this.outputCanvas.height <= 0) return;
+
+      if (srcW !== this.texW || srcH !== this.texH) {
+        this.texW = srcW;
+        this.texH = srcH;
         gl.bindTexture(gl.TEXTURE_2D, this.texture);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, this.texW, this.texH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
       }
@@ -253,7 +260,13 @@
 
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, this.texture);
-      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, this.sourceCanvas);
+      try {
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, this.sourceCanvas);
+      } catch (err) {
+        // Some browsers throw instead of just emitting a GL error when the
+        // source canvas is temporarily unusable. Skip this frame.
+        return;
+      }
 
       gl.uniform1i(this.locations.uTexture, 0);
       gl.uniform2f(this.locations.uResolution, gl.drawingBufferWidth, gl.drawingBufferHeight);

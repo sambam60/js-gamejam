@@ -63,9 +63,10 @@ export interface LegacyRenderState {
   kills: number;
   deaths: number;
   grapple: { tx: number; ty: number; shape: null } | null;
-  portals: { x: number; y: number; slot: number }[];
+  portals: { x: number; y: number; slot: number; ownerId: string }[];
   reflectors: { x: number; y: number; angle: number }[];
   bombs: { x: number; y: number; timer: number; exploding: number }[];
+  revives: { id: string; x: number; y: number }[];
   squares: SegmentedShape[];
   coins: { x: number; y: number; type: number }[];
   hearts: { x: number; y: number; heal: number }[];
@@ -92,6 +93,7 @@ export interface LegacyRenderState {
   matchMode: GameMode;
   winnerId: string | null;
   cameraX: number;
+  cameraY: number;
 }
 
 export interface LegacyBug {
@@ -135,7 +137,7 @@ export interface RemoteSwordSwing {
  */
 export interface RemotePlayerRender extends PlayerState {
   swordSwing: RemoteSwordSwing | null;
-  portals: { x: number; y: number; slot: number }[];
+  portals: { x: number; y: number; slot: number; ownerId: string }[];
   /** damageFlashSeconds converted into the 0..12-frame scale the renderer uses. */
   damageFlash: number;
   grapple: GrappleState | null;
@@ -255,7 +257,8 @@ function classifyProjectile(
 export function toRenderState(
   snapshot: GameState,
   localId: string,
-  screenWidth: number
+  screenWidth: number,
+  screenHeight: number
 ): RenderAdapterResult | null {
   const local: PlayerState | undefined =
     snapshot.players[localId] || (Object.values(snapshot.players)[0] as PlayerState | undefined);
@@ -329,7 +332,8 @@ export function toRenderState(
     portals: (snapshot.portals[local.id] || []).map((p) => ({
       x: p.x,
       y: p.y,
-      slot: typeof p.slot === "number" ? p.slot : 0
+      slot: typeof p.slot === "number" ? p.slot : 0,
+      ownerId: p.ownerId || local.id
     })),
     reflectors: (snapshot.reflectors || []).map((r) => ({ x: r.x, y: r.y, angle: r.angle || 0 })),
     bombs: (snapshot.bombs || []).map((b) => ({
@@ -338,6 +342,7 @@ export function toRenderState(
       timer: b.fuse || 0,
       exploding: b.explosionSeconds || 0
     })),
+    revives: (snapshot.revives || []).map((r) => ({ id: r.id, x: r.x, y: r.y })),
     squares: (snapshot.shapes || []).slice(),
     coins: (snapshot.coins || []).map((c) => ({ x: c.x, y: c.y, type: coinTypeFromValue(c.value) })),
     hearts: (snapshot.hearts || []).map((h) => ({ x: h.x, y: h.y, heal: h.value })),
@@ -367,7 +372,8 @@ export function toRenderState(
     gameStartTime: Date.now() - elapsedMs,
     matchMode: snapshot.mode || "coop",
     winnerId: snapshot.winnerId || null,
-    cameraX: Math.max(0, local.x - screenWidth * 0.35)
+    cameraX: Math.max(0, local.x - screenWidth * 0.35),
+    cameraY: Math.max(0, local.y - screenHeight * 0.65)
   };
   next.selectedSlot = Math.max(0, next.inventory.indexOf(local.selectedTool || next.inventory[0]));
 
@@ -379,7 +385,8 @@ export function toRenderState(
       portals: (snapshot.portals[p.id] || []).map((portal) => ({
         x: portal.x,
         y: portal.y,
-        slot: typeof portal.slot === "number" ? portal.slot : 0
+        slot: typeof portal.slot === "number" ? portal.slot : 0,
+        ownerId: portal.ownerId || p.id
       })),
       damageFlash: flashSecondsToFrames(p.damageFlashSeconds ?? 0),
       grapple: p.grapple || null

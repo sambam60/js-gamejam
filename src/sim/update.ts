@@ -1,16 +1,20 @@
 import {
   BOMB_COOLDOWN_SECONDS,
   BOMB_FUSE_SECONDS,
+  BUG_HEIGHT,
   BUG_SPAWN_SECONDS,
   BUG_SPAWN_SPREAD,
+  BUG_WIDTH,
   COIN_MAGNET_PULL,
   COIN_MAGNET_RANGE,
   COIN_SPAWN_MIN_SECONDS,
   COIN_SPAWN_RANDOM_SECONDS,
   COIN_SPAWN_SPREAD,
   COIN_VALUES,
+  DANGLY_HEIGHT,
   DANGLY_SPAWN_SECONDS,
   DANGLY_SPAWN_SPREAD,
+  DANGLY_WIDTH,
   DASH_COOLDOWN_SECONDS,
   FREEZE_COOLDOWN_SECONDS,
   FREEZE_LIFETIME_SECONDS,
@@ -51,7 +55,11 @@ import {
   SWORD_SWING_SECONDS,
   UPGRADE_SPAWN_MIN_SECONDS,
   UPGRADE_SPAWN_RANDOM_SECONDS,
-  UPGRADE_SPAWN_SPREAD
+  UPGRADE_SPAWN_SPREAD,
+  REVIVE_SKY_Y,
+  REVIVE_SPAWN_MIN_SECONDS,
+  REVIVE_SPAWN_RANDOM_SECONDS,
+  REVIVE_SPAWN_SPREAD
 } from "./constants";
 import { applySwordHitToBugs, createBug, stepBugs } from "./bugs";
 import { damageFish, damagePlayer } from "./damage";
@@ -59,15 +67,15 @@ import { applySwordHitToDanglies, createDangly, stepDanglies } from "./danglies"
 import { reflectProjectile, stepFish } from "./fish";
 import {
   circleIntersectsRect,
-  clampInsideWorld,
   ejectPlayerFromShape,
   getCollisionRects,
   hitShapeForGrapple,
   movePlayer,
-  playerRect
+  playerRect,
+  rectsOverlap
 } from "./physics";
 import { stepBombs, stepProjectiles, stepReflectors } from "./projectiles";
-import { cloneState, createPlayerState, isPlayerAlive, livingPlayers, resetWorldForMatch, respawnPlayer } from "./state";
+import { cloneState, createGameState, createPlayerState, isPlayerAlive, livingPlayers, resetWorldForMatch, respawnPlayer } from "./state";
 import { createShapeFromDraft, shapeContainsPoint } from "./shapes";
 import type {
   ClientMessage,
@@ -138,6 +146,20 @@ export function emptyInput(): InputState {
 }
 
 export function addPlayerToState(state: GameState, playerId: string, name: string): void {
+  // If a solo player is rejoining a gameover state with nobody else connected,
+  // reset the room back to a fresh lobby so "Start Match" is available. We
+  // DON'T reset when other players are still connected — otherwise the
+  // existing occupants get wiped from state.players and their clients drop
+  // into spectator mode watching the newcomer.
+  if (state.phase === "gameover") {
+    const otherConnected = Object.values(state.players).some(
+      (p) => p.id !== playerId && p.connected
+    );
+    if (!otherConnected) {
+      const next = createGameState(state.roomId, state.mode);
+      Object.assign(state, next);
+    }
+  }
   if (!state.players[playerId]) {
     state.players[playerId] = createPlayerState(playerId, sanitizeName(name));
   } else {
@@ -145,6 +167,12 @@ export function addPlayerToState(state: GameState, playerId: string, name: strin
     state.players[playerId].connected = true;
   }
   if (!state.hostId) state.hostId = playerId;
+  // Anyone joining a match-in-progress inherits the match's configured cheats
+  // so a friend who reconnects after death/leave gets the same upgrades as the
+  // rest of the lobby (rather than spawning back to bare square).
+  if (state.phase === "playing") {
+    applyCheatsToPlayer(state.players[playerId], state.cheats || {});
+  }
 }
 
 export function removePlayerFromState(state: GameState, playerId: string): void {
@@ -154,6 +182,13 @@ export function removePlayerFromState(state: GameState, playerId: string): void 
     const [nextHost] = Object.keys(state.players);
     state.hostId = nextHost ?? null;
   }
+  // When the last player leaves, reset the room to a fresh lobby so a later
+  // rejoin starts from a clean slate (fixes "Start Game" showing instead of
+  // "Start Match" after everyone leaves a gameover).
+  if (Object.keys(state.players).length === 0) {
+    const next = createGameState(state.roomId, state.mode);
+    Object.assign(state, next);
+  }
 }
 
 function averageSpawnX(state: GameState): number {
@@ -162,22 +197,102 @@ function averageSpawnX(state: GameState): number {
   return alive.reduce((sum, player) => sum + player.x, 0) / alive.length;
 }
 
+/** Radii used in applyPickups — keep spawn checks in sync. */
+const PICKUP_COLLISION_RADIUS = {
+  coin: 8,
+  heart: 10,
+  upgrade: 10,
+  revive: 12
+} as const;
+
+const SPAWN_PLAYER_CLEAR_ATTEMPTS = 22;
+
+function pointPickupClearOfLivingPlayers(
+  state: GameState,
+  x: number,
+  y: number,
+  pickupRadius: number
+): boolean {
+  for (const p of livingPlayers(state)) {
+    if (circleIntersectsRect({ x, y }, pickupRadius, playerRect(p))) return false;
+  }
+  return true;
+}
+
+function mobFootClearOfLivingPlayers(
+  state: GameState,
+  x: number,
+  y: number,
+  w: number,
+  h: number
+): boolean {
+  const rect = { x, y, width: w, height: h };
+  for (const p of livingPlayers(state)) {
+    if (rectsOverlap(rect, playerRect(p))) return false;
+  }
+  return true;
+}
+
+function pickPickupPosition(
+  state: GameState,
+  anchor: number,
+  spread: number,
+  yLo: number,
+  yHi: number,
+  pickupRadius: number
+): { x: number; y: number } {
+  for (let i = 0; i < SPAWN_PLAYER_CLEAR_ATTEMPTS; i++) {
+    const x = anchor + (Math.random() - 0.5) * spread;
+    const y = yLo + Math.random() * (yHi - yLo);
+    if (pointPickupClearOfLivingPlayers(state, x, y, pickupRadius)) return { x, y };
+  }
+  const midY = (yLo + yHi) / 2;
+  const amp = (yHi - yLo) * 0.45;
+  for (const dist of [55, 95, 140, 200, 260] as const) {
+    for (let deg = 0; deg < 360; deg += 25) {
+      const rad = (deg * Math.PI) / 180;
+      const x = anchor + Math.cos(rad) * dist;
+      const y = midY + Math.sin(rad) * amp;
+      const clampedY = Math.max(yLo, Math.min(yHi, y));
+      if (pointPickupClearOfLivingPlayers(state, x, clampedY, pickupRadius)) return { x, y: clampedY };
+    }
+  }
+  return {
+    x: anchor + (Math.random() - 0.5) * spread,
+    y: yLo + Math.random() * (yHi - yLo)
+  };
+}
+
+function pickMobSpawnX(state: GameState, anchor: number, spread: number, w: number, h: number, y: number): number {
+  for (let i = 0; i < SPAWN_PLAYER_CLEAR_ATTEMPTS; i++) {
+    const x = anchor + (Math.random() - 0.5) * spread;
+    if (mobFootClearOfLivingPlayers(state, x, y, w, h)) return x;
+  }
+  for (let k = 1; k <= 24; k++) {
+    const x = anchor + (k % 2 === 0 ? 1 : -1) * Math.ceil(k / 2) * (PLAYER_WIDTH + w + 12);
+    if (mobFootClearOfLivingPlayers(state, x, y, w, h)) return x;
+  }
+  return anchor + (Math.random() - 0.5) * spread;
+}
+
 function spawnCoin(state: GameState): void {
   const anchor = averageSpawnX(state);
+  const { x, y } = pickPickupPosition(state, anchor, COIN_SPAWN_SPREAD, 70, 250, PICKUP_COLLISION_RADIUS.coin);
   state.coins.push({
     id: createId("coin"),
-    x: anchor + (Math.random() - 0.5) * COIN_SPAWN_SPREAD,
-    y: 70 + Math.random() * 180,
+    x,
+    y,
     value: COIN_VALUES[Math.floor(Math.random() * COIN_VALUES.length)]
   });
 }
 
 function spawnHeart(state: GameState): void {
   const anchor = averageSpawnX(state);
+  const { x, y } = pickPickupPosition(state, anchor, HEART_SPAWN_SPREAD, 90, 230, PICKUP_COLLISION_RADIUS.heart);
   state.hearts.push({
     id: createId("heart"),
-    x: anchor + (Math.random() - 0.5) * HEART_SPAWN_SPREAD,
-    y: 90 + Math.random() * 140,
+    x,
+    y,
     value: 20
   });
 }
@@ -220,23 +335,36 @@ function spawnUpgradePickup(state: GameState): void {
   const available = UPGRADE_CATALOG.filter((u) => !owned.has(u.key));
   if (available.length === 0) return;
   const pick = available[Math.floor(Math.random() * available.length)];
+  const { x, y } = pickPickupPosition(state, anchor, UPGRADE_SPAWN_SPREAD, 80, 240, PICKUP_COLLISION_RADIUS.upgrade);
   state.upgrades.push({
     id: createId("upg"),
-    x: anchor + (Math.random() - 0.5) * UPGRADE_SPAWN_SPREAD,
-    y: 80 + Math.random() * 160,
+    x,
+    y,
     key: pick.key,
     cost: pick.cost
   });
 }
 
+function spawnRevivePickup(state: GameState): void {
+  const anchor = averageSpawnX(state);
+  const { x, y } = pickPickupPosition(state, anchor, REVIVE_SPAWN_SPREAD, 100, 260, PICKUP_COLLISION_RADIUS.revive);
+  state.revives.push({
+    id: createId("rev"),
+    x,
+    y
+  });
+}
+
 function spawnBugWave(state: GameState): void {
   const anchor = averageSpawnX(state);
-  state.bugs.push(createBug(anchor + (Math.random() - 0.5) * BUG_SPAWN_SPREAD, 0));
+  const bx = pickMobSpawnX(state, anchor, BUG_SPAWN_SPREAD, BUG_WIDTH, BUG_HEIGHT, 0);
+  state.bugs.push(createBug(bx, 0));
 }
 
 function spawnDangly(state: GameState): void {
   const anchor = averageSpawnX(state);
-  state.danglies.push(createDangly(anchor + (Math.random() - 0.5) * DANGLY_SPAWN_SPREAD, 0));
+  const dx = pickMobSpawnX(state, anchor, DANGLY_SPAWN_SPREAD, DANGLY_WIDTH, DANGLY_HEIGHT, 0);
+  state.danglies.push(createDangly(dx, 0));
 }
 
 // gj spawn gating (L2291-L2325): each timer counts DOWN, and when it hits ≤0 we
@@ -255,6 +383,17 @@ const SPAWNERS: Record<SpawnerKind, Spawner> = {
   coin: { minSeconds: COIN_SPAWN_MIN_SECONDS, randomSeconds: COIN_SPAWN_RANDOM_SECONDS, spawn: spawnCoin },
   heart: { minSeconds: HEART_SPAWN_MIN_SECONDS, randomSeconds: HEART_SPAWN_RANDOM_SECONDS, spawn: spawnHeart },
   upgrade: { minSeconds: UPGRADE_SPAWN_MIN_SECONDS, randomSeconds: UPGRADE_SPAWN_RANDOM_SECONDS, spawn: spawnUpgradePickup },
+  revive: {
+    minSeconds: REVIVE_SPAWN_MIN_SECONDS,
+    randomSeconds: REVIVE_SPAWN_RANDOM_SECONDS,
+    spawn: spawnRevivePickup,
+    // Only meaningful in coop and only while somebody is actually waiting to be
+    // revived. Also cap concurrent pickups so dead teammates can't flood the map.
+    canSpawn: (s) =>
+      s.mode === "coop" &&
+      (s.revives?.length ?? 0) < 2 &&
+      Object.values(s.players).some((p) => p.connected && !isPlayerAlive(p))
+  },
   bug: {
     minSeconds: BUG_SPAWN_SECONDS,
     randomSeconds: 0,
@@ -280,20 +419,52 @@ function stepSpawners(state: GameState, dt: number): void {
 }
 
 function stepPortals(state: GameState): void {
+  // Every player can traverse every owner's portal pair — in multiplayer this
+  // means one player can place a blue/orange gate and another player can step
+  // through it. Keeping pairs keyed by owner preserves per-player colors.
   for (const player of Object.values(state.players)) {
-    const playerPortals = state.portals[player.id] || [];
-    if (playerPortals.length !== 2 || player.portalTeleportCooldown > 0 || !isPlayerAlive(player)) continue;
-    const [portalA, portalB] = playerPortals;
+    if (player.portalTeleportCooldown > 0 || !isPlayerAlive(player)) continue;
     const center = { x: player.x + PLAYER_WIDTH / 2, y: player.y + 12 };
-    const useA = Math.hypot(center.x - portalA.x, center.y - portalA.y) <= PORTAL_RADIUS;
-    const useB = Math.hypot(center.x - portalB.x, center.y - portalB.y) <= PORTAL_RADIUS;
-    if (useA || useB) {
+    let teleported = false;
+    for (const pair of Object.values(state.portals)) {
+      if (!pair || pair.length !== 2) continue;
+      const [portalA, portalB] = pair;
+      const useA = Math.hypot(center.x - portalA.x, center.y - portalA.y) <= PORTAL_RADIUS;
+      const useB = Math.hypot(center.x - portalB.x, center.y - portalB.y) <= PORTAL_RADIUS;
+      if (!useA && !useB) continue;
       const destination = useA ? portalB : portalA;
       player.x = destination.x - PLAYER_WIDTH / 2;
       player.y = destination.y + 12;
       player.portalBoostX = useA ? PORTAL_BOOST_VX : -PORTAL_BOOST_VX;
       player.portalTeleportCooldown = PORTAL_TELEPORT_COOLDOWN_SECONDS;
+      teleported = true;
+      break;
     }
+    if (teleported) continue;
+  }
+}
+
+function respawnPlayerFromSky(player: PlayerState, index: number, originX: number): void {
+  // Give the player a fresh state like a normal respawn, then override position
+  // to a high Y so gravity can drop them back into the fight. The horizontal
+  // offset keeps multiple revived teammates from overlapping.
+  respawnPlayer(player, index);
+  player.x = originX + (index % 2 === 0 ? -1 : 1) * 24 * Math.ceil(index / 2);
+  player.y = REVIVE_SKY_Y;
+  player.vx = 0;
+  player.vy = 0;
+  player.onGround = false;
+}
+
+function collectReviveToken(state: GameState, originX: number): void {
+  const players = Object.values(state.players);
+  let index = 0;
+  for (const player of players) {
+    if (!player.connected) continue;
+    if (!isPlayerAlive(player)) {
+      respawnPlayerFromSky(player, index, originX);
+    }
+    index += 1;
   }
 }
 
@@ -311,6 +482,13 @@ function applyPickups(state: GameState): void {
       player.health = Math.min(player.maxHealth, player.health + heart.value);
       return false;
     });
+    if (state.mode === "coop" && state.revives && state.revives.length) {
+      state.revives = state.revives.filter((token) => {
+        if (!circleIntersectsRect({ x: token.x, y: token.y }, 12, rect)) return true;
+        collectReviveToken(state, token.x);
+        return false;
+      });
+    }
     state.upgrades = state.upgrades.filter((pickup) => {
       if (!circleIntersectsRect({ x: pickup.x, y: pickup.y }, 10, rect)) return true;
       if (player.score < pickup.cost) return true;
@@ -376,15 +554,19 @@ function applyToolAction(state: GameState, playerId: string, message: ToolMessag
   if (!player || !isPlayerAlive(player) || state.phase !== "playing") return;
 
   if (message.action === "portal" && message.target && player.cooldowns.portal <= 0 && player.inventory.includes("portal")) {
-    const portal = {
+    const current = state.portals[player.id] || [];
+    current.push({
       id: createId("portal"),
       ownerId: player.id,
-      ...clampInsideWorld(message.target),
-      slot: (state.portals[player.id] || []).length
-    };
-    const current = state.portals[player.id] || [];
-    current.push(portal);
+      x: message.target.x,
+      y: message.target.y,
+      slot: 0
+    });
     if (current.length > MAX_PORTALS_PER_PLAYER) current.shift();
+    // Reassign slots after trimming so the two surviving portals are always
+    // {0:A, 1:B} in order. Without this the renderer sees stale slot values
+    // (e.g. 1,2) after the third placement and draws both as the 'A' color.
+    current.forEach((portal, index) => { portal.slot = index; });
     state.portals[player.id] = current;
     player.cooldowns.portal = PORTAL_COOLDOWN_SECONDS;
   }
@@ -657,8 +839,18 @@ export function stepGame(
     state.winnerId = null;
   }
   if (mode === "pvp" && Object.keys(state.players).length >= 2 && living.length === 1) {
-    state.phase = "gameover";
-    state.winnerId = living[0]?.id ?? null;
+    // PvP players respawn after PLAYER_PVP_RESPAWN_SECONDS, so "only one alive"
+    // alone isn't game over — we have to wait out any pending respawns first.
+    // Only when the last surviving player has no opponents coming back via
+    // respawn do we actually end the match.
+    const winnerId = living[0].id;
+    const othersRespawning = Object.values(state.players).some(
+      (p) => p.id !== winnerId && p.connected && p.respawnSeconds > 0
+    );
+    if (!othersRespawning) {
+      state.phase = "gameover";
+      state.winnerId = winnerId;
+    }
   }
 
   return state;

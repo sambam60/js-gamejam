@@ -8,6 +8,9 @@
   let W, H;
 
   // leaderboard keys — grab free ones at dreamlo.com. Module in public/leaderboard.js.
+  //yes the keys are plaintext, technically you could add a fake score
+  //if you beat the top score you got a free bakery item
+  //but if you are reading this then email me via my website samfitch.com with the message 'THE CAKE IS A LIE'
   const leaderboardApi = window.LeaderboardSystem({
     private: '9fabDNnmmUufX_-XHl0eMQ5Rz-jJwYBEirxhcAQEpRZg',
     public: '69dd567a8f40bc2f605dff31',
@@ -121,6 +124,7 @@
     'idle_1', 'idle_2', 'idle_2_crouch', 'idle_3',
     'crouch_walk_0', 'crouch_walk_1', 'crouch_walk_2', 'crouch_walk_3',
     'coin', 'coin2', 'coin3', 'coin4',
+    'dead',
   ];
   let assetsLoaded = 0;
 
@@ -216,6 +220,8 @@
     lbError: false,
     lbLastFetch: 0,
     scoreSubmitted: false,
+    scrollY: 0,
+    userScrolled: false,
   };
   for (const k of ALL_CHEAT_KEYS) menu.cheats[k] = false;
   for (const cat of CHEAT_CATEGORIES) menu.expanded[cat.id] = false;
@@ -463,6 +469,7 @@
       idx = (idx + dir + items.length) % items.length;
       if (isSelectableMenuItem(items[idx])) {
         menu.selectedIndex = idx;
+        menu.userScrolled = false;
         return;
       }
     }
@@ -498,8 +505,56 @@
     return lines;
   }
 
+  function wrapTextToWidth(text, maxWidth, font) {
+    if (!text) return [''];
+    const prevFont = ctx.font;
+    ctx.font = font;
+    const out = [];
+    const words = String(text).split(' ');
+    let current = '';
+    for (const w of words) {
+      const test = current ? current + ' ' + w : w;
+      if (ctx.measureText(test).width <= maxWidth) {
+        current = test;
+        continue;
+      }
+      if (current) out.push(current);
+      if (ctx.measureText(w).width > maxWidth) {
+        let seg = '';
+        for (const ch of w) {
+          const testSeg = seg + ch;
+          if (ctx.measureText(testSeg).width <= maxWidth) {
+            seg = testSeg;
+          } else {
+            if (seg) out.push(seg);
+            seg = ch;
+          }
+        }
+        current = seg;
+      } else {
+        current = w;
+      }
+    }
+    if (current) out.push(current);
+    ctx.font = prevFont;
+    return out.length ? out : [String(text)];
+  }
+
+  function getMultiplayerStatusDisplayLines() {
+    const raw = getMultiplayerStatusLines();
+    const { rowW } = getMenuContentRect();
+    const rowPad = 10;
+    const maxW = Math.max(40, rowW - rowPad * 2);
+    const font = '10px ' + FONT_MONO;
+    const out = [];
+    for (const line of raw) {
+      for (const wrapped of wrapTextToWidth(line, maxW, font)) out.push(wrapped);
+    }
+    return out;
+  }
+
   function getMenuRowHeight(item) {
-    if (item === 'mp_status') return 18 + getMultiplayerStatusLines().length * 12;
+    if (item === 'mp_status') return 18 + getMultiplayerStatusDisplayLines().length * 12;
     if (item.startsWith('cheat_')) return 20;
     if (item === 'mode') return 40;
     return 32;
@@ -513,6 +568,10 @@
       return 'WAITING FOR HOST';
     }
     if (multiplayer.snapshot && multiplayer.snapshot.phase === 'playing') return 'MATCH LIVE';
+    if (multiplayer.snapshot && multiplayer.snapshot.phase === 'gameover') {
+      if (multiplayer.snapshot.hostId === multiplayer.localId) return 'NEW MATCH';
+      return 'WAITING FOR HOST';
+    }
     return 'START GAME';
   }
 
@@ -526,7 +585,8 @@
       connectMultiplayer(true);
       return;
     }
-    if (multiplayer.snapshot && multiplayer.snapshot.phase === 'lobby') {
+    const phase = multiplayer.snapshot && multiplayer.snapshot.phase;
+    if (phase === 'lobby' || phase === 'gameover') {
       if (multiplayer.snapshot.hostId === multiplayer.localId && multiplayer.session) {
         multiplayer.session.send({ type: 'setMode', mode: multiplayer.mode });
         multiplayer.session.send({ type: 'startGame', cheats: Object.assign({}, menu.cheats) });
@@ -720,16 +780,45 @@
     return rows;
   }
 
+  function getMenuContentHeight() {
+    const layout = getMenuLayout();
+    if (!layout.length) return 0;
+    const last = layout[layout.length - 1];
+    const bottom = last.y + getMenuRowHeight(last.item) / 2;
+    return bottom + 40;
+  }
+
+  function getMenuMaxScroll() {
+    const contentHeight = getMenuContentHeight();
+    return Math.max(0, contentHeight - H + 40);
+  }
+
   function getMenuScrollY() {
     normalizeMenuSelection();
     const layout = getMenuLayout();
     const maxVisibleY = H - 60;
+    const maxScroll = getMenuMaxScroll();
+    if (menu.userScrolled) {
+      // User-driven scroll (wheel / touch drag) takes precedence until they
+      // use keyboard navigation, which resets userScrolled and falls back to
+      // the selection-driven auto-scroll below.
+      menu.scrollY = Math.max(0, Math.min(menu.scrollY, maxScroll));
+      return menu.scrollY;
+    }
     let scrollY = 0;
     if (layout.length > 0) {
       const selRow = layout[Math.min(menu.selectedIndex, layout.length - 1)];
       if (selRow && selRow.y > maxVisibleY) scrollY = selRow.y - maxVisibleY + 40;
     }
-    return scrollY;
+    menu.scrollY = Math.max(0, Math.min(scrollY, maxScroll));
+    return menu.scrollY;
+  }
+
+  function adjustMenuScroll(deltaY) {
+    const maxScroll = getMenuMaxScroll();
+    if (maxScroll <= 0) return;
+    menu.userScrolled = true;
+    menu.scrollY = Math.max(0, Math.min(menu.scrollY + deltaY, maxScroll));
   }
 
   // menu rows are capped at 400px wide so they don't stretch on big screens
@@ -783,6 +872,7 @@
       direction: 'right',
       idleImg: idleImages[Math.floor(Math.random() * 3)],
       cameraX: 0,
+      cameraY: 0,
       squares: [],
       isDragging: false, dragStart: null, dragCurrent: null,
       score: 0, coins: [],
@@ -809,6 +899,7 @@
       reflectorCooldown: 0,
       bombs: [],
       bombCooldown: 0,
+      revives: [],
       fishShootPulse: 0,
       fishFrozen: 0,
       freezeCooldown: 0,
@@ -846,11 +937,20 @@
       state = base;
     }
     if (state.phase === 'paused') return;
+    // Host-triggered "NEW MATCH" flips the server straight from gameover to
+    // playing — pull any still-on-the-scoreboard clients into the new round
+    // instead of keeping them locked on their old gameover screen.
+    if (state.phase === 'gameover' && snapshot.phase === 'playing') {
+      const base = freshState();
+      base.phase = 'playing';
+      base.gameStartTime = Date.now();
+      state = base;
+    }
     if (state.phase === 'gameover' && snapshot.phase !== 'gameover') return;
 
     const adapter = window.ShapescapeSession && window.ShapescapeSession.toRenderState;
     if (!adapter) return;
-    const result = adapter(snapshot, multiplayer.localId || session.localId, W);
+    const result = adapter(snapshot, multiplayer.localId || session.localId, W, H);
     if (!result) return;
 
     const prevPhase = state.phase;
@@ -1040,7 +1140,7 @@
           }
           session.input.right = true; sessionSendInput(); e.preventDefault();
         }
-        if (e.code === 'KeyS' || e.code === 'ArrowDown' || e.code === 'ControlLeft' || e.code === 'ControlRight' || e.code === 'KeyC') { session.input.crouch = true; sessionSendInput(); e.preventDefault(); }
+        if (e.code === 'KeyS' || e.code === 'ArrowDown' || e.code === 'KeyC') { session.input.crouch = true; sessionSendInput(); e.preventDefault(); }
         if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') { session.input.sprint = true; sessionSendInput(); }
         if (e.code === 'KeyE') {
           session.input.dash = true; sessionSendInput();
@@ -1064,14 +1164,19 @@
     if (e.code === 'ArrowRight' || e.code === 'KeyD') session.input.right = false;
     if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') session.input.jump = false;
     if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') session.input.sprint = false;
-    if (e.code === 'KeyS' || e.code === 'ArrowDown' || e.code === 'ControlLeft' || e.code === 'ControlRight' || e.code === 'KeyC') session.input.crouch = false;
+    if (e.code === 'KeyS' || e.code === 'ArrowDown' || e.code === 'KeyC') session.input.crouch = false;
     sessionSendInput();
   });
 
   window.addEventListener('blur', () => { drawSnapAltHeld = false; });
 
-  // Scroll wheel to cycle inventory
+  // Scroll wheel: cycle inventory while playing, scroll the menu otherwise.
   canvas.addEventListener('wheel', e => {
+    if (state.phase === 'menu') {
+      e.preventDefault();
+      adjustMenuScroll(e.deltaY);
+      return;
+    }
     if (!sessionActive() || state.phase !== 'playing' || state.inventory.length <= 1) return;
     e.preventDefault();
     const nextIdx = e.deltaY > 0
@@ -1153,7 +1258,10 @@
   function canvasCoords(clientX, clientY) {
     const rect = canvas.getBoundingClientRect();
     const scaleX = W / rect.width, scaleY = H / rect.height;
-    return { x: (clientX - rect.left) * scaleX + state.cameraX, y: H - (clientY - rect.top) * scaleY };
+    return {
+      x: (clientX - rect.left) * scaleX + state.cameraX,
+      y: H - (clientY - rect.top) * scaleY + (state.cameraY || 0)
+    };
   }
 
   function snapWorldPointToGrid(p) {
@@ -1222,7 +1330,14 @@
 
   canvas.addEventListener('mousedown', e => {
     mouseHeld = true;
-    if (state.phase === 'menu') { handleMenuClick(e); return; }
+    if (state.phase === 'menu') {
+      // Prevent default so the browser doesn't move focus to <body>/canvas and
+      // clobber the .focus() call in setActiveField(). Without this, clicking
+      // a text field on desktop never actually focuses the hidden input.
+      e.preventDefault();
+      handleMenuClick(e);
+      return;
+    }
     if (state.phase === 'gameover') {
       if (sessionActive() && session.kind === 'local') teardownSession();
       state.phase = 'menu'; return;
@@ -1265,13 +1380,23 @@
   canvas.addEventListener('mouseup', () => { mouseHeld = false; finishDrag(); });
   window.addEventListener('mouseup', () => { mouseHeld = false; });
 
+  // Track touch drag in the menu so we can differentiate a tap (activate row)
+  // from a scroll gesture (drag the menu up/down on mobile).
+  let menuTouchDrag = null;
+  const MENU_TOUCH_TAP_PX = 8;
   canvas.addEventListener('touchstart', e => {
     e.preventDefault();
     mouseHeld = true;
     if (state.phase === 'menu') {
       if (e.touches.length) {
         const t = e.touches[0];
-        handleMenuClick({ clientX: t.clientX, clientY: t.clientY });
+        menuTouchDrag = {
+          startX: t.clientX,
+          startY: t.clientY,
+          lastY: t.clientY,
+          moved: false,
+          scale: (H / canvas.getBoundingClientRect().height) || 1
+        };
       }
       return;
     }
@@ -1315,12 +1440,38 @@
   }, { passive: false });
   canvas.addEventListener('touchmove', e => {
     e.preventDefault();
+    if (state.phase === 'menu' && menuTouchDrag && e.touches.length) {
+      const t = e.touches[0];
+      const dx = t.clientX - menuTouchDrag.startX;
+      const dy = t.clientY - menuTouchDrag.startY;
+      if (Math.hypot(dx, dy) > MENU_TOUCH_TAP_PX) menuTouchDrag.moved = true;
+      const delta = menuTouchDrag.lastY - t.clientY;
+      adjustMenuScroll(delta * menuTouchDrag.scale);
+      menuTouchDrag.lastY = t.clientY;
+      return;
+    }
     if (!state.isDragging || !e.touches.length || !state.dragStart) return;
     const raw = canvasCoords(e.touches[0].clientX, e.touches[0].clientY);
     state.dragCurrent = snapDragEndForTool(state.dragStart, raw, getCurrentTool(), drawSnapAltHeld);
   }, { passive: false });
-  canvas.addEventListener('touchend', e => { e.preventDefault(); mouseHeld = false; finishDrag(); }, { passive: false });
-  canvas.addEventListener('touchcancel', e => { e.preventDefault(); mouseHeld = false; finishDrag(); }, { passive: false });
+  canvas.addEventListener('touchend', e => {
+    e.preventDefault();
+    mouseHeld = false;
+    if (state.phase === 'menu' && menuTouchDrag) {
+      if (!menuTouchDrag.moved) {
+        handleMenuClick({ clientX: menuTouchDrag.startX, clientY: menuTouchDrag.startY });
+      }
+      menuTouchDrag = null;
+      return;
+    }
+    finishDrag();
+  }, { passive: false });
+  canvas.addEventListener('touchcancel', e => {
+    e.preventDefault();
+    mouseHeld = false;
+    menuTouchDrag = null;
+    finishDrag();
+  }, { passive: false });
 
   function finishDrag() {
     if (!state.isDragging || !state.dragStart || !state.dragCurrent) {
@@ -1661,6 +1812,37 @@
     return state.crouching ? CHAR_H_CROUCH : CHAR_H;
   }
 
+  /** Feet stay at world `y`; corpse is scaled to CHAR_H tall, centered on the 32px player slot. */
+  function drawPlayerCorpseSprite(x, y, direction, cam, fillFallback, damageFlash) {
+    const img = assets.dead;
+    const dh = CHAR_H;
+    const dw =
+      img && img.naturalWidth && img.naturalHeight
+        ? Math.max(1, Math.round(img.naturalWidth * (dh / img.naturalHeight)))
+        : CHAR_W;
+    const px = x + (CHAR_W - dw) / 2 - cam;
+    const py = H - y - dh;
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    if ((direction || 'right') === 'left') {
+      ctx.translate(px + dw, py);
+      ctx.scale(-1, 1);
+    } else ctx.translate(px, py);
+    if (img && img.complete) ctx.drawImage(img, 0, 0, dw, dh);
+    else {
+      ctx.fillStyle = fillFallback;
+      ctx.fillRect(0, 0, dw, dh);
+    }
+    if (damageFlash > 0) {
+      ctx.globalCompositeOperation = 'source-atop';
+      ctx.fillStyle = `rgba(255,51,51,${Math.min(0.6, (damageFlash || 0) / 12 * 0.6)})`;
+      ctx.fillRect(0, 0, dw, dh);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+    ctx.imageSmoothingEnabled = true;
+    ctx.restore();
+  }
+
   function hasCheatsEnabled() {
     return ALL_CHEAT_KEYS.some(function (k) { return menu.cheats[k]; });
   }
@@ -1785,18 +1967,52 @@
     }
   }
 
+  // Stable, distinct per-player (owner) portal color pair. A/B hues are 180°
+  // apart so they're always visually distinguishable; different owners also
+  // get different base hues via a cheap string hash so two players' portals
+  // don't collide visually.
+  function hashString(str) {
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < (str || '').length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+  function hslToRgb(h, s, l) {
+    const a = s * Math.min(l, 1 - l);
+    const f = (n) => {
+      const k = (n + h / 30) % 12;
+      return l - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)));
+    };
+    return [Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255)];
+  }
+  function portalColorsFor(ownerId, slot) {
+    const baseHue = hashString(ownerId || 'local') % 360;
+    const hue = (baseHue + (slot === 1 ? 180 : 0)) % 360;
+    const [r, g, b] = hslToRgb(hue, 0.85, 0.58);
+    const [br, bg, bb] = hslToRgb(hue, 0.85, 0.72);
+    const [ir, ig, ib] = hslToRgb(hue, 0.85, 0.42);
+    const [dr, dg, db] = hslToRgb(hue, 0.85, 0.16);
+    const [vr, vg, vb] = hslToRgb(hue, 0.8, 0.06);
+    const hex = (rr, gg, bb2) => '#' + ((1 << 24) + (rr << 16) + (gg << 8) + bb2).toString(16).slice(1);
+    return {
+      col: hex(r, g, b),
+      colBright: hex(br, bg, bb),
+      colInner: hex(ir, ig, ib),
+      colDark: hex(dr, dg, db),
+      colVoid: hex(vr, vg, vb),
+      glow: `rgba(${r},${g},${b},0.5)`
+    };
+  }
+
   // Renders one portal with the full animated Portal-2 look. `pt.slot` is the
-  // per-owner slot (0=A/blue, 1=B/orange) so placement order is visually stable
-  // across both the local player and every remote player we draw.
+  // per-owner slot (0=A, 1=B) so placement order is visually stable. Each owner
+  // gets a unique hue pair so two players' portals can't be confused.
   function drawPortal(pt, cam) {
     const slot = pt.slot === 1 ? 1 : 0;
     const ptx = pt.x - cam, pty = H - pt.y;
-    const col = slot === 0 ? '#3399ff' : '#ff8c1a';
-    const colBright = slot === 0 ? '#66bbff' : '#ffaa44';
-    const colInner = slot === 0 ? '#1a6dd6' : '#cc6600';
-    const colDark = slot === 0 ? '#0a2244' : '#331a00';
-    const colVoid = slot === 0 ? '#050e1a' : '#1a0d00';
-    const glow = slot === 0 ? 'rgba(51,153,255,0.5)' : 'rgba(255,140,26,0.5)';
+    const { col, colBright, colInner, colDark, colVoid, glow } = portalColorsFor(pt.ownerId, slot);
     const pulse = 0.7 + Math.sin(frameTick * 0.08 + slot * 3) * 0.3;
 
     const PW = 12, PH = 48;
@@ -1869,6 +2085,28 @@
   }
 
   function drawMultiplayerPlayer(player, cam, isLocal) {
+    const dead = player.health != null && player.health <= 0;
+    if (dead) {
+      drawPlayerCorpseSprite(
+        player.x,
+        player.y,
+        player.direction,
+        cam,
+        isLocal ? COL.bright : COL.primary,
+        player.damageFlash || 0
+      );
+      if (player.name) {
+        const px = player.x - cam;
+        const py = H - player.y - CHAR_H;
+        ctx.fillStyle = isLocal ? COL.cyan : COL.mid;
+        ctx.font = '9px ' + FONT_MONO;
+        ctx.textAlign = 'center';
+        ctx.fillText(player.name.toUpperCase(), px + CHAR_W / 2, py - 8);
+        ctx.textAlign = 'left';
+      }
+      return;
+    }
+
     const moving = Math.abs(player.vx || 0) > 0.15;
     const crouching = !!player.crouching;
     const hitH = crouching ? CHAR_H_CROUCH : CHAR_H;
@@ -1888,6 +2126,19 @@
       ctx.beginPath(); ctx.moveTo(gpx, gpy); ctx.lineTo(gtx, gty); ctx.stroke();
       ctx.fillStyle = COL.amber;
       ctx.beginPath(); ctx.arc(gtx, gty, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+
+    // dash afterimage (same geometry as local `state.dashActive` block in render())
+    if ((player.dashSeconds || 0) > 0) {
+      const ph = hitH;
+      ctx.save(); ctx.globalAlpha = 0.3;
+      ctx.fillStyle = COL.amber;
+      for (let di = 1; di <= 3; di++) {
+        const off = di * 10 * ((player.direction || 'right') === 'right' ? -1 : 1);
+        ctx.globalAlpha = 0.3 - di * 0.08;
+        ctx.fillRect(px + off, py + (CHAR_H - ph), CHAR_W, ph);
+      }
       ctx.restore();
     }
 
@@ -1973,7 +2224,14 @@
     maybeSendDraftUpdate();
 
     const cam = state.cameraX;
+    const camY = state.cameraY || 0;
     drawSkyAndStars(cam);
+
+    // Vertical camera is applied as a canvas translation so we don't have to thread
+    // `camY` through every `H - y` conversion in the renderer. HUD and overlays are
+    // drawn after we restore.
+    ctx.save();
+    ctx.translate(0, camY);
 
     ctx.strokeStyle = COL.dim;
     ctx.lineWidth = 1;
@@ -2155,6 +2413,28 @@
       ctx.fillText('+' + h.heal + 'HP', hx, hy - 14); ctx.textAlign = 'left';
     }
 
+    // revive tokens (coop) — pulsating green cross, falls into the pool of
+    // pickups only when someone on the team is waiting to respawn.
+    if (state.revives && state.revives.length) {
+      for (const r of state.revives) {
+        const rx = r.x - cam, ry = H - r.y;
+        const pulse = 0.6 + Math.sin(frameTick * 0.12) * 0.4;
+        ctx.save();
+        ctx.shadowColor = `rgba(102,255,140,${pulse * 0.7})`;
+        ctx.shadowBlur = 14;
+        ctx.fillStyle = `rgba(102,255,140,${pulse})`;
+        const s = 8;
+        ctx.fillRect(Math.floor(rx) - 2, Math.floor(ry) - s, 4, s * 2);
+        ctx.fillRect(Math.floor(rx) - s, Math.floor(ry) - 2, s * 2, 4);
+        ctx.restore();
+        ctx.fillStyle = '#66ff8c';
+        ctx.font = '8px ' + FONT_MONO;
+        ctx.textAlign = 'center';
+        ctx.fillText('REVIVE', rx, ry - 14);
+        ctx.textAlign = 'left';
+      }
+    }
+
     // upgrade pickups (drawn as a little diamond)
     for (const u of state.upgrades) {
       const def = UPGRADE_DEFS[u.key], ux = u.x - cam, uy = H - u.y;
@@ -2255,7 +2535,7 @@
     }
 
     // dash afterimage
-    if (state.dashActive > 0) {
+    if (state.health > 0 && state.dashActive > 0) {
       const ph = playerHitH();
       const dtx = state.playerX - cam, dty = H - state.playerY - CHAR_H;
       ctx.save(); ctx.globalAlpha = 0.3;
@@ -2270,7 +2550,7 @@
 
     // glide wing lines above player
     // sim is Y-up: vy < 0 means falling, which is when the glide cosmetic should show.
-    if (state.activeUpgrades.glide && !state.onGround && state.playerVY < 0 && (state.mobileJumpHeld || keys['Space'] || keys['ArrowUp'] || keys['KeyW'])) {
+    if (state.health > 0 && state.activeUpgrades.glide && !state.onGround && state.playerVY < 0 && (state.mobileJumpHeld || keys['Space'] || keys['ArrowUp'] || keys['KeyW'])) {
       const glx = state.playerX + CHAR_W / 2 - cam, gly = H - state.playerY - playerHitH() - 4;
       ctx.save(); ctx.globalAlpha = 0.4;
       ctx.strokeStyle = COL.primary; ctx.lineWidth = 1;
@@ -2284,47 +2564,51 @@
       for (const rp of multiplayer.remotePlayers) drawMultiplayerPlayer(rp, cam, false);
     }
 
-    // player sprite
-    const isMoving = state.movingLeft || state.movingRight;
-    const px = state.playerX - cam, py = H - state.playerY - CHAR_H;
-    ctx.save(); ctx.imageSmoothingEnabled = false;
-    if (state.direction === 'left') { ctx.translate(px + CHAR_W, py); ctx.scale(-1, 1); }
-    else ctx.translate(px, py);
-    let playerImg;
-    if (state.crouching && isMoving) {
-      walkFrame = 0; walkTimer = 0;
-      crouchWalkTimer++;
-      if (crouchWalkTimer > 7) {
-        crouchWalkTimer = 0;
-        crouchWalkFrame = (crouchWalkFrame + 1) % crouchWalkImages.length;
-      }
-      playerImg = assets[crouchWalkImages[crouchWalkFrame]];
-    } else if (state.crouching) {
-      walkFrame = 0; walkTimer = 0;
-      crouchWalkFrame = 0; crouchWalkTimer = 0;
-      playerImg = assets.idle_2_crouch;
-    } else if (isMoving) {
-      crouchWalkFrame = 0; crouchWalkTimer = 0;
-      walkTimer++;
-      if (walkTimer > (isSprintActive() ? 5 : 8)) { walkTimer = 0; walkFrame = (walkFrame + 1) % 3; }
-      playerImg = assets[idleImages[walkFrame]];
+    // player sprite (prone corpse while dead / waiting to respawn)
+    if (state.health <= 0) {
+      drawPlayerCorpseSprite(state.playerX, state.playerY, state.direction, cam, COL.primary, state.damageFlash);
     } else {
-      playerImg = assets[state.idleImg];
-      walkFrame = 0; walkTimer = 0;
-      crouchWalkFrame = 0; crouchWalkTimer = 0;
+      const isMoving = state.movingLeft || state.movingRight;
+      const px = state.playerX - cam, py = H - state.playerY - CHAR_H;
+      ctx.save(); ctx.imageSmoothingEnabled = false;
+      if (state.direction === 'left') { ctx.translate(px + CHAR_W, py); ctx.scale(-1, 1); }
+      else ctx.translate(px, py);
+      let playerImg;
+      if (state.crouching && isMoving) {
+        walkFrame = 0; walkTimer = 0;
+        crouchWalkTimer++;
+        if (crouchWalkTimer > 7) {
+          crouchWalkTimer = 0;
+          crouchWalkFrame = (crouchWalkFrame + 1) % crouchWalkImages.length;
+        }
+        playerImg = assets[crouchWalkImages[crouchWalkFrame]];
+      } else if (state.crouching) {
+        walkFrame = 0; walkTimer = 0;
+        crouchWalkFrame = 0; crouchWalkTimer = 0;
+        playerImg = assets.idle_2_crouch;
+      } else if (isMoving) {
+        crouchWalkFrame = 0; crouchWalkTimer = 0;
+        walkTimer++;
+        if (walkTimer > (isSprintActive() ? 5 : 8)) { walkTimer = 0; walkFrame = (walkFrame + 1) % 3; }
+        playerImg = assets[idleImages[walkFrame]];
+      } else {
+        playerImg = assets[state.idleImg];
+        walkFrame = 0; walkTimer = 0;
+        crouchWalkFrame = 0; crouchWalkTimer = 0;
+      }
+      if (playerImg && playerImg.complete) ctx.drawImage(playerImg, 0, 0, CHAR_W, CHAR_H);
+      else { ctx.fillStyle = COL.primary; ctx.fillRect(0, 0, CHAR_W, CHAR_H); }
+      if (state.damageFlash > 0) {
+        ctx.globalCompositeOperation = 'source-atop';
+        ctx.fillStyle = `rgba(255,51,51,${state.damageFlash / 12 * 0.6})`;
+        ctx.fillRect(0, 0, CHAR_W, CHAR_H);
+        ctx.globalCompositeOperation = 'source-over';
+      }
+      ctx.imageSmoothingEnabled = true; ctx.restore();
     }
-    if (playerImg && playerImg.complete) ctx.drawImage(playerImg, 0, 0, CHAR_W, CHAR_H);
-    else { ctx.fillStyle = COL.primary; ctx.fillRect(0, 0, CHAR_W, CHAR_H); }
-    if (state.damageFlash > 0) {
-      ctx.globalCompositeOperation = 'source-atop';
-      ctx.fillStyle = `rgba(255,51,51,${state.damageFlash / 12 * 0.6})`;
-      ctx.fillRect(0, 0, CHAR_W, CHAR_H);
-      ctx.globalCompositeOperation = 'source-over';
-    }
-    ctx.imageSmoothingEnabled = true; ctx.restore();
 
     // sword swing animation
-    if (state.swordSwing && state.swordSwing.frame <= 12) {
+    if (state.health > 0 && state.swordSwing && state.swordSwing.frame <= 12) {
       const sw = state.swordSwing;
       const scx = state.playerX + CHAR_W / 2 - cam;
       const scy = H - state.playerY - playerHitH() / 2;
@@ -2558,6 +2842,8 @@
       }
     }
 
+    ctx.restore();
+
     drawHUD();
     updateHotbarDOM();
     if (mouseOnCanvas) drawTooltips(cam);
@@ -2655,6 +2941,11 @@
     const hp = Math.max(0, state.health);
     const barW = 120, barH = 12;
 
+    const hudMobile = isMobilePauseHints();
+    const mpConnected = multiplayer.active && multiplayer.connected;
+    const scoreSecondRow = hudMobile && mpConnected;
+    const tagRightPad = mpConnected ? 220 : 10;
+
     ctx.fillStyle = COL.mid; ctx.font = '10px ' + FONT_MONO;
     ctx.fillText('HP', x, y + 10);
     ctx.fillStyle = COL.bgPanel; ctx.fillRect(x + 22, y, barW, barH);
@@ -2673,19 +2964,45 @@
 
     ctx.fillStyle = hp > 50 ? COL.primary : hp > 25 ? COL.amberPri : COL.red;
     ctx.font = '10px ' + FONT_MONO;
-    ctx.fillText(hp + '%', x + 22 + barW + 6, y + 10);
+    const hpPctX = x + 22 + barW + 6;
+    ctx.fillText(hp + '%', hpPctX, y + 10);
+    const hpRowTagStart = hpPctX + ctx.measureText(hp + '%').width + 16;
 
+    const scoreBaselineY = scoreSecondRow ? y + 22 : y + 10;
     const scoreX = x + 22 + barW + 50;
-    ctx.fillStyle = COL.mid; ctx.font = '10px ' + FONT_MONO; ctx.fillText('SCORE:', scoreX, y + 10);
-    ctx.fillStyle = COL.bright;
-    ctx.save(); ctx.shadowColor = COL.glowWeak; ctx.shadowBlur = 6;
-    ctx.fillText(String(state.score), scoreX + 52, y + 10); ctx.restore();
+    if (scoreSecondRow) {
+      const scoreLeft = x + 22;
+      const maxRight = W - tagRightPad;
+      let px = 10;
+      for (; px >= 8; px--) {
+        ctx.font = px + 'px ' + FONT_MONO;
+        const numX = scoreLeft + ctx.measureText('SCORE:').width + 4;
+        const totalRight = numX + ctx.measureText(String(state.score)).width;
+        if (totalRight <= maxRight || px === 8) break;
+      }
+      ctx.fillStyle = COL.mid;
+      ctx.fillText('SCORE:', scoreLeft, scoreBaselineY);
+      ctx.fillStyle = COL.bright;
+      ctx.save(); ctx.shadowColor = COL.glowWeak; ctx.shadowBlur = 6;
+      ctx.fillText(String(state.score), scoreLeft + ctx.measureText('SCORE:').width + 4, scoreBaselineY);
+      ctx.restore();
+    } else {
+      ctx.font = '10px ' + FONT_MONO;
+      ctx.fillStyle = COL.mid;
+      ctx.fillText('SCORE:', scoreX, scoreBaselineY);
+      ctx.fillStyle = COL.bright;
+      ctx.save(); ctx.shadowColor = COL.glowWeak; ctx.shadowBlur = 6;
+      ctx.fillText(String(state.score), scoreX + 52, scoreBaselineY);
+      ctx.restore();
+    }
 
-    let tagX = scoreX + 52 + ctx.measureText(String(state.score)).width + 16;
+    ctx.font = '10px ' + FONT_MONO;
+    let tagX = scoreSecondRow
+      ? hpRowTagStart
+      : scoreX + 52 + ctx.measureText(String(state.score)).width + 16;
     let tagY = y;
     const tagGap = 16;
-    const tagLineH = 15;
-    const tagRightPad = (multiplayer.active && multiplayer.connected) ? 220 : 10;
+    const tagLineH = scoreSecondRow ? 18 : 15;
     const tagWrapX = x;
     ctx.font = '9px ' + FONT_MONO;
     const tags = [
@@ -3184,7 +3501,7 @@
         ctx.font = 'bold 10px ' + FONT_MONO; ctx.textAlign = 'right';
         ctx.fillText(multiplayer.active ? 'ACTIVE' : 'IDLE', colMidR, row.y + 5);
       } else if (item === 'mp_status') {
-        const lines = getMultiplayerStatusLines();
+        const lines = getMultiplayerStatusDisplayLines();
         ctx.strokeStyle = 'rgba(255, 204, 0, 0.2)';
         ctx.lineWidth = 1;
         ctx.beginPath();

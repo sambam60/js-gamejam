@@ -1,4 +1,5 @@
-// Leaderboard I/O. Uses dreamlo (http-only, no CORS) — on https pages we go through
+// Leaderboard I/O. DreamLo is fetched via same-origin proxy on https (CORS). On http
+// origins we call dreamlo directly.
 // the /api/dreamlo Vercel proxy, otherwise we call the origin directly.
 //
 // Extracted from game.js so the menu closure doesn't own XHR. All state (cache,
@@ -16,6 +17,13 @@ window.LeaderboardSystem = function (config) {
 
   function dreamloUrl(path) {
     if (location.protocol === 'https:') {
+      // PartyKit only exposes per-room HTTP at /parties/<party>/<room>, so we
+      // route the proxy through a dedicated "dreamlo" room there. On Vercel
+      // (and any other host that serves this static bundle) we keep using the
+      // serverless `/api/dreamlo` endpoint.
+      if (/\.partykit\.dev$/i.test(location.hostname)) {
+        return '/parties/main/dreamlo?path=' + encodeURIComponent(path);
+      }
       return '/api/dreamlo?path=' + encodeURIComponent(path);
     }
     return 'http://dreamlo.com/lb/' + path;

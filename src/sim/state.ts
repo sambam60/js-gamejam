@@ -109,6 +109,7 @@ export function createGameState(roomId: string, mode: GameMode = "coop"): GameSt
     portals: {},
     reflectors: [],
     bombs: [],
+    revives: [],
     spawnTimers: {
       // gj: each spawn checks "now - lastSpawn > min + rand(random)" → first spawn after
       // a full min+random window. Seed each timer with that window to match.
@@ -116,7 +117,8 @@ export function createGameState(roomId: string, mode: GameMode = "coop"): GameSt
       heart: HEART_SPAWN_MIN_SECONDS + Math.random() * HEART_SPAWN_RANDOM_SECONDS,
       bug: BUG_SPAWN_SECONDS,
       dangly: DANGLY_SPAWN_SECONDS,
-      upgrade: UPGRADE_SPAWN_MIN_SECONDS + Math.random() * UPGRADE_SPAWN_RANDOM_SECONDS
+      upgrade: UPGRADE_SPAWN_MIN_SECONDS + Math.random() * UPGRADE_SPAWN_RANDOM_SECONDS,
+      revive: 10
     }
   };
 }
