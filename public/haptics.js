@@ -49,6 +49,15 @@
   let hapticCheckbox = null;
   let domInitialized = false;
   let rafId = null;
+  let debugPanel = null;
+
+  const debugFromURL = (() => {
+    try {
+      if (typeof location === 'undefined') return false;
+      return /(?:^|[?&])haptic-debug=1\b/.test(location.search || '');
+    } catch (_) { return false; }
+  })();
+  if (debugFromURL) showSwitch = true;
 
   function normalizeInput(input) {
     if (typeof input === 'number') return [{ duration: input }];
@@ -177,12 +186,74 @@
     applySwitchVisibility();
   }
 
+  function buildDebugPanel() {
+    if (debugPanel || typeof document === 'undefined' || !document.body) return;
+    const panel = document.createElement('div');
+    panel.id = 'haptic-debug-panel';
+    panel.style.cssText =
+      'position:fixed;top:8px;right:8px;z-index:100000;' +
+      'background:rgba(0,0,0,0.85);color:#fff;font:12px -apple-system,sans-serif;' +
+      'padding:8px;border-radius:8px;max-width:220px;' +
+      'display:grid;grid-template-columns:1fr 1fr;gap:4px;' +
+      'box-shadow:0 4px 12px rgba(0,0,0,0.4);';
+    const title = document.createElement('div');
+    title.textContent = 'HAPTIC DEBUG';
+    title.style.cssText = 'grid-column:1/-1;font-weight:bold;text-align:center;padding-bottom:4px;';
+    panel.appendChild(title);
+
+    const info = document.createElement('div');
+    const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+    info.textContent =
+      'vibrate:' + (canVibrate ? 'yes' : 'no') +
+      '  iOS:' + (/iP(hone|ad|od)/.test(ua) ? 'yes' : 'no');
+    info.style.cssText = 'grid-column:1/-1;font-size:10px;opacity:0.7;text-align:center;padding-bottom:4px;';
+    panel.appendChild(info);
+
+    const presets = Object.keys(DEFAULT_PATTERNS);
+    presets.forEach(name => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = name;
+      btn.style.cssText =
+        'all:unset;display:block;text-align:center;padding:6px 4px;' +
+        'background:#333;color:#fff;border-radius:4px;cursor:pointer;' +
+        'font:11px -apple-system,sans-serif;';
+      btn.addEventListener('touchstart', e => {
+        e.preventDefault();
+        trigger(name);
+      }, { passive: false });
+      btn.addEventListener('click', () => trigger(name));
+      panel.appendChild(btn);
+    });
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.textContent = 'HIDE';
+    closeBtn.style.cssText =
+      'all:unset;grid-column:1/-1;text-align:center;padding:6px;margin-top:4px;' +
+      'background:#722;color:#fff;border-radius:4px;font:11px -apple-system,sans-serif;';
+    closeBtn.addEventListener('click', () => {
+      panel.remove();
+      debugPanel = null;
+      showSwitch = false;
+      applySwitchVisibility();
+    });
+    panel.appendChild(closeBtn);
+
+    document.body.appendChild(panel);
+    debugPanel = panel;
+  }
+
   function initDOMWhenReady() {
     if (typeof document === 'undefined') return;
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', ensureDOM, { once: true });
-    } else {
+    const setup = () => {
       ensureDOM();
+      if (debugFromURL) buildDebugPanel();
+    };
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', setup, { once: true });
+    } else {
+      setup();
     }
   }
   initDOMWhenReady();
@@ -295,6 +366,7 @@
     setEnabled: v => { enabled = !!v; if (!v) stop(); },
     isEnabled: () => enabled,
     setShowSwitch: v => { showSwitch = !!v; applySwitchVisibility(); },
+    showDebugPanel: () => { showSwitch = true; applySwitchVisibility(); buildDebugPanel(); },
     patterns: DEFAULT_PATTERNS,
   };
 })();
