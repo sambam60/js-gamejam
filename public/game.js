@@ -918,7 +918,7 @@
   // Snapshot → legacy render-state is implemented in TypeScript
   // (src/client/render-adapter.ts) so the mapping is typed and testable. This
   // wrapper only handles phase-transition policy and idle-sprite preservation,
-  // which depend on game.js-local state (idleImages, onGameOver, pause clock).
+  // which depend on game.js-local state (idleImages, onGameOver, pause clock)
   function applyMultiplayerSnapshot(snapshot) {
     if (!snapshot) return;
     if (snapshot.phase === 'lobby') {
