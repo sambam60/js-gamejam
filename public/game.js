@@ -236,7 +236,16 @@
     remotePlayers: [],
     status: 'OFFLINE',
     roomCode: '',
-    host: localStorage.getItem('shapescape_partykit_host') || location.host,
+    host: (() => {
+      const saved = localStorage.getItem('shapescape_partykit_host') || '';
+      // Older builds accidentally persisted location.host (*.vercel.app) here; those
+      // values point at nothing and must never be used as a PartyKit host.
+      if (/\.vercel\.app$/i.test(saved)) {
+        localStorage.removeItem('shapescape_partykit_host');
+        return '';
+      }
+      return saved;
+    })(),
     mode: 'coop',
     playerNotifs: [],      // { text, joinedAt, type:'join'|'leave' }
     prevPlayerIds: null,   // Map<id, name> — null until first snapshot
@@ -660,7 +669,7 @@
     if (!multiplayer.available) return;
     menu.playerName = (menu.playerName || 'ANON').slice(0, 16);
     multiplayer.roomCode = (multiplayer.roomCode || Math.random().toString(36).slice(2, 8)).toUpperCase();
-    multiplayer.host = (multiplayer.host || location.host).trim();
+    multiplayer.host = (multiplayer.host || '').trim();
     disconnectMultiplayer(false);
     multiplayer.active = true;
     multiplayer.status = isHost ? 'HOSTING...' : 'JOINING...';
@@ -954,6 +963,8 @@
     if (!result) return;
 
     const prevPhase = state.phase;
+    const prevHealth = typeof state.health === 'number' ? state.health : null;
+    const prevCoinCount = Array.isArray(state.coins) ? state.coins.length : null;
     const next = result.next;
 
     // Preserve draw-in-progress + idle sprite across frames.
@@ -976,7 +987,28 @@
 
     state = next;
     multiplayer.remotePlayers = result.remotePlayers;
+    if (
+      prevPhase === 'playing' &&
+      next.phase === 'playing' &&
+      prevHealth !== null &&
+      typeof next.health === 'number' &&
+      next.health < prevHealth &&
+      next.health > 0
+    ) {
+      const dmg = prevHealth - next.health;
+      haptic(dmg >= 25 ? 'error' : 'heavy');
+    }
+    if (
+      prevPhase === 'playing' &&
+      next.phase === 'playing' &&
+      prevCoinCount !== null &&
+      Array.isArray(next.coins) &&
+      next.coins.length < prevCoinCount
+    ) {
+      haptic('selection');
+    }
     if (prevPhase !== 'gameover' && next.phase === 'gameover') {
+      haptic('error');
       onGameOver();
     }
   }
@@ -1536,6 +1568,7 @@
         });
         slot.addEventListener('touchstart', e => {
           e.preventDefault(); e.stopPropagation();
+          if (window.haptics) window.haptics.trigger('selection');
           const idx = parseInt(slot.dataset.idx);
           state.selectedSlot = idx;
           if (sessionActive() && state.inventory[idx]) sessionSend({ type: 'selectTool', tool: state.inventory[idx] });
@@ -1677,6 +1710,7 @@
   let lastMobileRightTap = 0;
   function triggerDash(_dirSign) {
     if (!sessionActive()) return;
+    haptic('heavy');
     session.input.dash = true; sessionSendInput();
     setTimeout(() => { session.input.dash = false; sessionSendInput(); }, 80);
   }
@@ -1698,9 +1732,14 @@
     }
   }
 
-  function mobileBtn(btn, onDown, onUp) {
+  function haptic(preset) {
+    if (window.haptics && window.haptics.trigger) window.haptics.trigger(preset);
+  }
+
+  function mobileBtn(btn, onDown, onUp, hapticPreset) {
     if (!btn) return;
-    btn.addEventListener('touchstart', e => { e.preventDefault(); onDown(); }, { passive: false });
+    const preset = hapticPreset || 'selection';
+    btn.addEventListener('touchstart', e => { e.preventDefault(); haptic(preset); onDown(); }, { passive: false });
     btn.addEventListener('touchend', e => { e.preventDefault(); onUp(); }, { passive: false });
     btn.addEventListener('touchcancel', e => { e.preventDefault(); onUp(); }, { passive: false });
     btn.addEventListener('mousedown', onDown);
@@ -1708,23 +1747,24 @@
     btn.addEventListener('mouseleave', onUp);
   }
 
-  function mobileBtnPlaying(btn, onDown, onUp) {
+  function mobileBtnPlaying(btn, onDown, onUp, hapticPreset) {
     if (!btn) return;
     const down = () => {
       if (state.phase === 'paused') { resumeFromPause(); return; }
       onDown();
     };
-    mobileBtn(btn, down, onUp);
+    mobileBtn(btn, down, onUp, hapticPreset);
   }
 
-  function mobileTap(btn, handler) {
+  function mobileTap(btn, handler, hapticPreset) {
     if (!btn) return;
+    const preset = hapticPreset || 'light';
     const run = e => {
       if (e.type === 'mousedown' && e.button !== 0) return;
       e.preventDefault();
       handler();
     };
-    btn.addEventListener('touchstart', e => { e.preventDefault(); handler(); }, { passive: false });
+    btn.addEventListener('touchstart', e => { e.preventDefault(); haptic(preset); handler(); }, { passive: false });
     btn.addEventListener('click', run);
   }
 
@@ -1734,14 +1774,14 @@
     session.input.left = true; sessionSendInput();
   }, () => {
     if (sessionActive()) { session.input.left = false; sessionSendInput(); }
-  });
+  }, 'selection');
   mobileBtnPlaying(btnRight, () => {
     touchDirDoubleTap(false);
     if (state.phase !== 'playing' || !sessionActive()) return;
     session.input.right = true; sessionSendInput();
   }, () => {
     if (sessionActive()) { session.input.right = false; sessionSendInput(); }
-  });
+  }, 'selection');
   mobileBtnPlaying(btnJump, () => {
     if (state.phase !== 'playing' || !sessionActive()) return;
     state.mobileJumpHeld = true;
@@ -1749,7 +1789,7 @@
   }, () => {
     state.mobileJumpHeld = false;
     if (sessionActive()) { session.input.jump = false; sessionSendInput(); }
-  });
+  }, 'medium');
   mobileBtnPlaying(btnSprint, () => {
     if (state.phase !== 'playing' || !sessionActive()) return;
     state.mobileSprintHeld = true;
@@ -1757,7 +1797,7 @@
   }, () => {
     state.mobileSprintHeld = false;
     if (sessionActive()) { session.input.sprint = false; sessionSendInput(); }
-  });
+  }, 'light');
   mobileBtnPlaying(btnCrouch, () => {
     if (state.phase !== 'playing' || !sessionActive()) return;
     state.mobileCrouch = true;
@@ -1765,11 +1805,11 @@
   }, () => {
     state.mobileCrouch = false;
     if (sessionActive()) { session.input.crouch = false; sessionSendInput(); }
-  });
+  }, 'light');
   mobileTap(btnPause, () => {
     if (state.phase === 'playing') pauseGameplay();
     else if (state.phase === 'paused') resumeFromPause();
-  });
+  }, 'light');
 
   // start / restart game
   function startGame() {

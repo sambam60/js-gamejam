@@ -454,9 +454,16 @@ export class NetworkSession extends BaseSession {
   }
 }
 
+// Priority:
+//   1. Build-time PARTYKIT_HOST (authoritative in prod — Vercel deploys always bake this in)
+//   2. Explicit override (localStorage / cheat menu) — for devs pointing at another PartyKit host
+//   3. window.location.host (local dev where `partykit dev` serves the static site on the same origin)
+// An override that's clearly not a PartyKit host (e.g. a stale *.vercel.app value saved by an
+// older buggy build) is ignored so users aren't stuck reconnecting to a dead endpoint.
 export function resolvePartyKitHost(override = ""): string {
-  if (override.trim()) return override.trim();
   if (__PARTYKIT_HOST__) return __PARTYKIT_HOST__;
+  const cleaned = override.trim();
+  if (cleaned && !/\.vercel\.app$/i.test(cleaned)) return cleaned;
   return window.location.host;
 }
 
