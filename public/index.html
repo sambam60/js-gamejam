@@ -31,6 +31,21 @@
 </div>
 
 <script src="haptics.js"></script>
+<script type="module">
+  // Reference implementation loaded for A/B testing with ?haptic-debug=1.
+  // Exposes window.iosHapticsLib = { haptic, confirm, error }.
+  try {
+    const mod = await import('https://esm.sh/ios-haptics@latest');
+    window.iosHapticsLib = {
+      haptic: mod.haptic,
+      confirm: mod.haptic && mod.haptic.confirm,
+      error: mod.haptic && mod.haptic.error,
+    };
+    console.log('[haptics] ios-haptics library loaded');
+  } catch (e) {
+    console.warn('[haptics] failed to load ios-haptics library', e);
+  }
+</script>
 <script src="bugs.js"></script>
 <script src="danglies.js"></script>
 <script src="crt-shader.js"></script>

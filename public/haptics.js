@@ -51,6 +51,8 @@
   let rafId = null;
   let debugPanel = null;
   let debugLogEl = null;
+  // Engine: 'ours' | 'lib'. Toggled in debug panel; otherwise always 'ours'.
+  let engine = 'ours';
 
   const debugFromURL = (() => {
     try {
@@ -244,6 +246,54 @@
       panel.appendChild(btn);
     });
 
+    // Engine toggle: our impl vs the real ios-haptics library.
+    const engineBtn = document.createElement('button');
+    engineBtn.type = 'button';
+    const renderEngine = () => {
+      engineBtn.textContent = 'ENGINE: ' + (engine === 'lib' ? 'LIB' : 'OURS');
+    };
+    renderEngine();
+    engineBtn.style.cssText =
+      'all:unset;grid-column:1/-1;text-align:center;padding:6px;margin-top:4px;' +
+      'background:#036;color:#fff;border-radius:4px;font:11px -apple-system,sans-serif;';
+    engineBtn.addEventListener('click', () => {
+      engine = engine === 'lib' ? 'ours' : 'lib';
+      renderEngine();
+      dbg('engine=' + engine);
+    });
+    panel.appendChild(engineBtn);
+
+    // Overlay capture: tap anywhere on the screen to fire a haptic using
+    // the current engine. Lets us tell whether the game-button layout is
+    // what's suppressing haptics, vs. something inherent to the code path.
+    const overlayBtn = document.createElement('button');
+    overlayBtn.type = 'button';
+    overlayBtn.textContent = 'TAP-ANYWHERE: OFF';
+    overlayBtn.style.cssText =
+      'all:unset;grid-column:1/-1;text-align:center;padding:6px;margin-top:4px;' +
+      'background:#363;color:#fff;border-radius:4px;font:11px -apple-system,sans-serif;';
+    let overlay = null;
+    overlayBtn.addEventListener('click', () => {
+      if (overlay) {
+        overlay.remove();
+        overlay = null;
+        overlayBtn.textContent = 'TAP-ANYWHERE: OFF';
+        return;
+      }
+      overlay = document.createElement('div');
+      overlay.style.cssText =
+        'position:fixed;inset:0;z-index:99999;background:rgba(0,50,100,0.08);';
+      const handler = e => {
+        e.preventDefault();
+        trigger('light');
+      };
+      overlay.addEventListener('touchstart', handler, { passive: false });
+      overlay.addEventListener('mousedown', handler);
+      document.body.appendChild(overlay);
+      overlayBtn.textContent = 'TAP-ANYWHERE: ON';
+    });
+    panel.appendChild(overlayBtn);
+
     const closeBtn = document.createElement('button');
     closeBtn.type = 'button';
     closeBtn.textContent = 'HIDE';
@@ -252,6 +302,7 @@
       'background:#722;color:#fff;border-radius:4px;font:11px -apple-system,sans-serif;';
     closeBtn.addEventListener('click', () => {
       panel.remove();
+      if (overlay) { overlay.remove(); overlay = null; }
       debugPanel = null;
       showSwitch = false;
       applySwitchVisibility();
@@ -281,7 +332,7 @@
   // on a persistent one. Mirror the tijnjh/ios-haptics approach: build a
   // throwaway element, click the label (which forwards to the input once),
   // then remove it.
-  function fireSwitchClick() {
+  function fireOurs() {
     if (typeof document === 'undefined') { dbg('fire: no doc'); return; }
     const parent = document.head || document.body;
     if (!parent) { dbg('fire: no parent'); return; }
@@ -296,10 +347,26 @@
       parent.appendChild(label);
       label.click();
       parent.removeChild(label);
-      dbg('fire: fresh ok');
+      dbg('fire: ours ok');
     } catch (e) {
       dbg('fire: err ' + (e && e.message || ''));
     }
+  }
+
+  function fireLib() {
+    const libHaptic = window.iosHapticsLib && window.iosHapticsLib.haptic;
+    if (typeof libHaptic !== 'function') {
+      dbg('fire: lib not loaded');
+      fireOurs();
+      return;
+    }
+    try { libHaptic(); dbg('fire: lib ok'); }
+    catch (e) { dbg('fire: lib err ' + (e && e.message || '')); }
+  }
+
+  function fireSwitchClick() {
+    if (engine === 'lib') fireLib();
+    else fireOurs();
   }
 
   function stopPattern() {
