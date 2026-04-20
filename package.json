@@ -1,0 +1,19 @@
+{
+  "name": "shapescape",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "dev": "node scripts/dev.mjs",
+    "dev:client": "node esbuild.config.mjs --watch",
+    "dev:party": "partykit dev",
+    "typecheck": "tsc --noEmit",
+    "deploy:party": "partykit deploy"
+  },
+  "dependencies": {
+    "esbuild": "^0.28.0",
+    "partykit": "^0.0.115",
+    "partysocket": "^1.1.16",
+    "typescript": "^6.0.2"
+  }
+}

@@ -1,14 +1,22 @@
 (function () {
   const canvas = document.getElementById('game');
+  const crtCanvas = document.getElementById('crt-overlay');
   const ctx = canvas.getContext('2d');
   const container = document.getElementById('canvas-container');
   const gameWrapper = document.getElementById('game-wrapper');
 
   let W, H;
 
-  // leaderboard keys — grab free ones at dreamlo.com
-  const DREAMLO_PRIVATE = '9fabDNnmmUufX_-XHl0eMQ5Rz-jJwYBEirxhcAQEpRZg';
-  const DREAMLO_PUBLIC  = '69dd567a8f40bc2f605dff31';
+  // leaderboard keys — grab free ones at dreamlo.com. Module in public/leaderboard.js.
+  //yes the keys are plaintext, technically you could add a fake score
+  //if you beat the top score you got a free bakery item
+  //but if you are reading this then email me via my website samfitch.com with the message 'THE CAKE IS A LIE'
+  const leaderboardApi = window.LeaderboardSystem({
+    private: '9fabDNnmmUufX_-XHl0eMQ5Rz-jJwYBEirxhcAQEpRZg',
+    public: '69dd567a8f40bc2f605dff31',
+  });
+  const formatLeaderboardTime = leaderboardApi.formatTime;
+  const CRT_PREF_KEY = 'shapescape_crt_enabled';
 
   // colours and fonts — green terminal look, red for damage, amber for warnings
   const FONT_DISPLAY = '"Redaction 35", Georgia, serif';
@@ -45,6 +53,23 @@
   // background stars — parallax scrolling
   let starPositions = [];
   let frameTick = 0;
+  let crtRenderer = null;
+
+  // FPS tracking for the multiplayer "stats for nerds" HUD
+  const fpsMeter = { samples: [], lastAt: 0, value: 0 };
+  function tickFps(now) {
+    if (fpsMeter.lastAt > 0) {
+      const dt = now - fpsMeter.lastAt;
+      if (dt > 0 && dt < 1000) fpsMeter.samples.push(dt);
+      if (fpsMeter.samples.length > 60) fpsMeter.samples.shift();
+    }
+    fpsMeter.lastAt = now;
+    if (fpsMeter.samples.length >= 10) {
+      let sum = 0;
+      for (const s of fpsMeter.samples) sum += s;
+      fpsMeter.value = 1000 / (sum / fpsMeter.samples.length);
+    }
+  }
 
   function regenerateStars() {
     starPositions = [];
@@ -74,6 +99,7 @@
     W = cw;
     H = ch;
     regenerateStars();
+    if (crtRenderer) crtRenderer.resize(cw, ch, dpr);
   }
 
   window.addEventListener('resize', resizeCanvas);
@@ -95,32 +121,35 @@
   // load all sprites before starting
   const assets = {};
   const assetList = [
-    'idle_1', 'idle_2', 'idle_3', 'little_gif_guy',
+    'idle_1', 'idle_2', 'idle_2_crouch', 'idle_3',
+    'crouch_walk_0', 'crouch_walk_1', 'crouch_walk_2', 'crouch_walk_3',
     'coin', 'coin2', 'coin3', 'coin4',
+    'dead',
   ];
   let assetsLoaded = 0;
 
   function loadAssets(onDone) {
     assetList.forEach(name => {
       const img = new Image();
-      const ext = name === 'little_gif_guy' ? 'gif' : 'png';
-      img.src = name + '.' + ext;
+      img.src = name + '.png';
       img.onload = () => { assetsLoaded++; if (assetsLoaded >= assetList.length) onDone(); };
       img.onerror = () => { assetsLoaded++; if (assetsLoaded >= assetList.length) onDone(); };
       assets[name] = img;
     });
   }
 
-  // game constants — tweak these to adjust feel
+  // visuals — the simulation lives in src/sim and doesn't need movement constants here.
   const CHAR_W = 32;
   const CHAR_H = 32;
-  const GRAVITY = 0.3;
-  const MOVE_SPEED = 2;
-  const SPRINT_SPEED = 3.6;
-  const JUMP_VEL = -6;
-  const FISH_SPAWN_DELAY = 120000;
+  /** Collision/visual feet-aligned height while crouching (standing uses CHAR_H). */
+  const CHAR_H_CROUCH = 20;
   const idleImages = ['idle_1', 'idle_2', 'idle_3'];
+  const crouchWalkImages = ['crouch_walk_0', 'crouch_walk_1', 'crouch_walk_2', 'crouch_walk_3'];
+  /** Sprite tier → score value (mirrors coinTypeFromValue). Used only for the tooltip overlay. */
   const COIN_VALUES = { 1: 1, 2: 5, 3: 10, 4: 15 };
+
+  /** World units — hold Option/Alt while drawing to snap to this grid (and snap line angles). */
+  const DRAW_SNAP_GRID = 16;
 
   // tools and upgrades
   const TOOLS = {
@@ -177,7 +206,10 @@
 
   const menu = {
     playerName: '',
-    nameActive: false,
+    activeField: '',
+    multiplayerMode: false,
+    crtEnabled: false,
+    crtSupported: false,
     cheats: {},
     selectedIndex: 0,
     expanded: {},
@@ -188,12 +220,522 @@
     lbError: false,
     lbLastFetch: 0,
     scoreSubmitted: false,
+    scrollY: 0,
+    userScrolled: false,
   };
   for (const k of ALL_CHEAT_KEYS) menu.cheats[k] = false;
   for (const cat of CHEAT_CATEGORIES) menu.expanded[cat.id] = false;
 
+  const multiplayer = {
+    available: !!(window.ShapescapeSession && window.ShapescapeSession.startMultiplayer),
+    active: false,
+    connected: false,
+    session: null,
+    snapshot: null,
+    localId: '',
+    remotePlayers: [],
+    status: 'OFFLINE',
+    roomCode: '',
+    host: localStorage.getItem('shapescape_partykit_host') || location.host,
+    mode: 'coop',
+    playerNotifs: [],      // { text, joinedAt, type:'join'|'leave' }
+    prevPlayerIds: null,   // Map<id, name> — null until first snapshot
+  };
+
+  const session = {
+    active: false,
+    handle: null,
+    kind: null,
+    localId: '',
+    input: { left: false, right: false, jump: false, sprint: false, crouch: false, dash: false },
+  };
+
+  function sessionActive() {
+    return session.active && session.handle !== null;
+  }
+
+  function sessionSend(message) {
+    if (!sessionActive()) return false;
+    session.handle.send(message);
+    return true;
+  }
+
+  function sessionSendInput() {
+    if (!sessionActive()) return;
+    session.handle.sendInput(Object.assign({}, session.input));
+  }
+
+  // --- live draft preview broadcasting --------------------------------------
+  // While the local player is dragging a shape / placing polygon vertices,
+  // we mirror the in-progress preview to the server so every other player
+  // can see what's being drawn before it's committed. Updates are throttled
+  // to avoid spamming the wire with a packet per mousemove — the preview
+  // only has to look continuous, not frame-perfect.
+  const DRAFT_THROTTLE_MS = 60;
+  let lastDraftSentAt = 0;
+  let lastDraftSentKey = '';
+
+  function draftTool() {
+    const tool = getCurrentTool();
+    return tool === 'square' ? 'square' : tool;
+  }
+
+  function computeLocalDraft() {
+    if (state.phase !== 'playing') return null;
+    const tool = getCurrentTool();
+    if (state.isDragging && state.dragStart && state.dragCurrent
+        && (tool === 'square' || tool === 'circle' || tool === 'triangle' || tool === 'line')) {
+      return {
+        tool: draftTool(),
+        start: { x: state.dragStart.x, y: state.dragStart.y },
+        end: { x: state.dragCurrent.x, y: state.dragCurrent.y },
+      };
+    }
+    if (tool === 'polygon' && state.polyPoints.length > 0) {
+      return {
+        tool: 'polygon',
+        points: state.polyPoints.map(p => ({ x: p.x, y: p.y })),
+        cursor: mouseOnCanvas ? { x: mouseWorld.x, y: mouseWorld.y } : undefined,
+      };
+    }
+    if (tool === 'bezier' && state.bezierPoints.length > 0 && state.bezierPoints.length < 3) {
+      return {
+        tool: 'bezier',
+        points: state.bezierPoints.map(p => ({ x: p.x, y: p.y })),
+        cursor: mouseOnCanvas ? { x: mouseWorld.x, y: mouseWorld.y } : undefined,
+      };
+    }
+    return null;
+  }
+
+  // Cheap stringification used only for change-detection. Rounding to whole
+  // pixels keeps sub-pixel mouse jitter from triggering a network send.
+  function draftKey(draft) {
+    if (!draft) return '';
+    const r = (p) => p ? (Math.round(p.x) + ',' + Math.round(p.y)) : '';
+    let k = draft.tool + '|' + r(draft.start) + '|' + r(draft.end) + '|' + r(draft.cursor);
+    if (draft.points) k += '|' + draft.points.map(r).join(';');
+    return k;
+  }
+
+  function maybeSendDraftUpdate() {
+    if (!sessionActive() || session.kind !== 'network') return;
+    const draft = computeLocalDraft();
+    const key = draftKey(draft);
+    if (key === lastDraftSentKey) return;
+    const now = performance.now();
+    // Always send the clearing update (key === '') immediately so peers don't
+    // see a frozen ghost preview hanging in the world after we stop drafting.
+    if (key !== '' && now - lastDraftSentAt < DRAFT_THROTTLE_MS) return;
+    lastDraftSentKey = key;
+    lastDraftSentAt = now;
+    sessionSend({ type: 'drawUpdate', draft });
+  }
+
+  function getMultiplayerPanelReserve() {
+    return 0;
+  }
+
+  function ensureMultiplayerPanel() {
+    return null;
+  }
+
+  function setInputValueIfIdle(el, value) {
+    return;
+  }
+
+  function syncMultiplayerPanel() {
+    return;
+  }
+
+  function isMenuTextItem(item) {
+    return item === 'name' || item === 'mp_room' || item === 'mp_host';
+  }
+
+  function isSelectableMenuItem(item) {
+    if (item === 'mp_status') return false;
+    if (item === 'mp_join' && multiplayer.active) return false;
+    if (item === 'mp_matchmode' && isMatchModeLocked()) return false;
+    if ((item === 'mp_room' || item === 'mp_host') && multiplayer.active) return false;
+    return true;
+  }
+
+  function isMatchModeLocked() {
+    return !!(multiplayer.active
+      && multiplayer.snapshot
+      && multiplayer.snapshot.hostId
+      && multiplayer.snapshot.hostId !== multiplayer.localId);
+  }
+
+  function getMenuTextValue(item) {
+    if (item === 'name') return menu.playerName || '';
+    if (item === 'mp_room') return multiplayer.roomCode || '';
+    if (item === 'mp_host') return multiplayer.host || '';
+    return '';
+  }
+
+  function isMultiplayerMenuItem(item) {
+    return item.startsWith('mp_');
+  }
+
+  function setMenuTextValue(item, value) {
+    if (item === 'name') {
+      menu.playerName = value.slice(0, 16);
+      return;
+    }
+    if (item === 'mp_room') {
+      multiplayer.roomCode = value.toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 12);
+      return;
+    }
+    if (item === 'mp_host') {
+      multiplayer.host = value.replace(/\s+/g, '').slice(0, 120);
+      localStorage.setItem('shapescape_partykit_host', multiplayer.host);
+    }
+  }
+
+  // Hidden DOM input used to summon the mobile virtual keyboard when editing
+  // menu text fields. We mirror menu.activeField state into .focus()/.blur()
+  // and sync characters via the input event to avoid double-entry with the
+  // window-level keydown handler.
+  const menuTextInput = document.getElementById('menu-text-input');
+  let menuInputSyncing = false;
+
+  function menuTextInputFocused() {
+    return !!menuTextInput && document.activeElement === menuTextInput;
+  }
+
+  function setActiveField(field) {
+    const next = field || '';
+    menu.activeField = next;
+    if (!menuTextInput) return;
+    if (next) {
+      menuInputSyncing = true;
+      menuTextInput.value = getMenuTextValue(next);
+      menuTextInput.setAttribute('autocapitalize', next === 'mp_host' ? 'off' : 'characters');
+      menuTextInput.setAttribute('inputmode', next === 'mp_host' ? 'url' : 'text');
+      try { menuTextInput.focus({ preventScroll: true }); }
+      catch (_) { menuTextInput.focus(); }
+      menuInputSyncing = false;
+    } else if (menuTextInputFocused()) {
+      menuTextInput.blur();
+    }
+  }
+
+  if (menuTextInput) {
+    menuTextInput.addEventListener('input', () => {
+      if (menuInputSyncing || !menu.activeField) return;
+      setMenuTextValue(menu.activeField, menuTextInput.value);
+      const normalized = getMenuTextValue(menu.activeField);
+      if (menuTextInput.value !== normalized) {
+        menuInputSyncing = true;
+        menuTextInput.value = normalized;
+        menuInputSyncing = false;
+      }
+    });
+    menuTextInput.addEventListener('blur', () => {
+      if (menu.activeField) menu.activeField = '';
+    });
+    menuTextInput.addEventListener('keydown', (e) => {
+      if (e.code === 'Enter' || e.code === 'Escape') {
+        e.preventDefault();
+        menuTextInput.blur();
+      }
+    });
+  }
+
+  function normalizeMenuSelection() {
+    const items = getMenuItems();
+    if (!items.length) {
+      menu.selectedIndex = 0;
+      return;
+    }
+    menu.selectedIndex = Math.max(0, Math.min(menu.selectedIndex, items.length - 1));
+    if (isSelectableMenuItem(items[menu.selectedIndex])) return;
+    for (let i = 0; i < items.length; i++) {
+      if (isSelectableMenuItem(items[i])) {
+        menu.selectedIndex = i;
+        return;
+      }
+    }
+    menu.selectedIndex = 0;
+  }
+
+  function moveMenuSelection(dir) {
+    const items = getMenuItems();
+    if (!items.length) return;
+    normalizeMenuSelection();
+    let idx = menu.selectedIndex;
+    for (let i = 0; i < items.length; i++) {
+      idx = (idx + dir + items.length) % items.length;
+      if (isSelectableMenuItem(items[idx])) {
+        menu.selectedIndex = idx;
+        menu.userScrolled = false;
+        return;
+      }
+    }
+  }
+
+  function getMultiplayerStatusLines() {
+    if (!multiplayer.available) return ['PARTYKIT BRIDGE NOT LOADED'];
+    const lines = [];
+    lines.push('STATUS: ' + multiplayer.status + (multiplayer.connected && multiplayer.roomCode ? '  ROOM: ' + multiplayer.roomCode : ''));
+    if (!multiplayer.active || !multiplayer.connected) {
+      lines.push('START HOSTS A ROOM. JOIN USES ROOM CODE.');
+      return lines;
+    }
+    if (multiplayer.snapshot && multiplayer.snapshot.phase === 'lobby') {
+      const players = Object.values(multiplayer.snapshot.players || {});
+      lines.push('LOBBY: ' + players.length + ' PLAYER' + (players.length === 1 ? '' : 'S'));
+      const visiblePlayers = players.slice(0, 4);
+      for (const p of visiblePlayers) {
+        let label = p.name || 'ANON';
+        if (p.id === multiplayer.snapshot.hostId) label += ' [HOST]';
+        if (p.id === multiplayer.localId) label += ' [YOU]';
+        lines.push(label);
+      }
+      if (players.length > visiblePlayers.length) lines.push('+' + (players.length - visiblePlayers.length) + ' MORE');
+      lines.push(multiplayer.snapshot.hostId === multiplayer.localId ? 'PRESS START TO LAUNCH MATCH' : 'WAITING FOR HOST TO START');
+      return lines;
+    }
+    if (multiplayer.snapshot && multiplayer.snapshot.phase === 'playing') {
+      lines.push('MATCH LIVE');
+      return lines;
+    }
+    lines.push('NOT CONNECTED TO A MATCH YET');
+    return lines;
+  }
+
+  function wrapTextToWidth(text, maxWidth, font) {
+    if (!text) return [''];
+    const prevFont = ctx.font;
+    ctx.font = font;
+    const out = [];
+    const words = String(text).split(' ');
+    let current = '';
+    for (const w of words) {
+      const test = current ? current + ' ' + w : w;
+      if (ctx.measureText(test).width <= maxWidth) {
+        current = test;
+        continue;
+      }
+      if (current) out.push(current);
+      if (ctx.measureText(w).width > maxWidth) {
+        let seg = '';
+        for (const ch of w) {
+          const testSeg = seg + ch;
+          if (ctx.measureText(testSeg).width <= maxWidth) {
+            seg = testSeg;
+          } else {
+            if (seg) out.push(seg);
+            seg = ch;
+          }
+        }
+        current = seg;
+      } else {
+        current = w;
+      }
+    }
+    if (current) out.push(current);
+    ctx.font = prevFont;
+    return out.length ? out : [String(text)];
+  }
+
+  function getMultiplayerStatusDisplayLines() {
+    const raw = getMultiplayerStatusLines();
+    const { rowW } = getMenuContentRect();
+    const rowPad = 10;
+    const maxW = Math.max(40, rowW - rowPad * 2);
+    const font = '10px ' + FONT_MONO;
+    const out = [];
+    for (const line of raw) {
+      for (const wrapped of wrapTextToWidth(line, maxW, font)) out.push(wrapped);
+    }
+    return out;
+  }
+
+  function getMenuRowHeight(item) {
+    if (item === 'mp_status') return 18 + getMultiplayerStatusDisplayLines().length * 12;
+    if (item.startsWith('cheat_')) return 20;
+    if (item === 'mode') return 40;
+    return 32;
+  }
+
+  function getStartMenuLabel() {
+    if (!menu.multiplayerMode) return 'START GAME';
+    if (!multiplayer.active || !multiplayer.connected) return 'HOST GAME';
+    if (multiplayer.snapshot && multiplayer.snapshot.phase === 'lobby') {
+      if (multiplayer.snapshot.hostId === multiplayer.localId) return 'START MATCH';
+      return 'WAITING FOR HOST';
+    }
+    if (multiplayer.snapshot && multiplayer.snapshot.phase === 'playing') return 'MATCH LIVE';
+    if (multiplayer.snapshot && multiplayer.snapshot.phase === 'gameover') {
+      if (multiplayer.snapshot.hostId === multiplayer.localId) return 'NEW MATCH';
+      return 'WAITING FOR HOST';
+    }
+    return 'START GAME';
+  }
+
+  function activateStartAction() {
+    setActiveField('');
+    if (!menu.multiplayerMode) {
+      startGame();
+      return;
+    }
+    if (!multiplayer.active || !multiplayer.connected) {
+      connectMultiplayer(true);
+      return;
+    }
+    const phase = multiplayer.snapshot && multiplayer.snapshot.phase;
+    if (phase === 'lobby' || phase === 'gameover') {
+      if (multiplayer.snapshot.hostId === multiplayer.localId && multiplayer.session) {
+        multiplayer.session.send({ type: 'setMode', mode: multiplayer.mode });
+        multiplayer.session.send({ type: 'startGame', cheats: Object.assign({}, menu.cheats) });
+      } else {
+        multiplayer.status = 'WAITING FOR HOST';
+        syncMultiplayerPanel();
+      }
+    }
+  }
+
+  function isTypingInField() {
+    const ae = document.activeElement;
+    return !!(ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA'));
+  }
+
+  function teardownSession() {
+    if (session.handle) session.handle.disconnect();
+    session.active = false;
+    session.handle = null;
+    session.kind = null;
+    session.localId = '';
+    for (const k in session.input) session.input[k] = false;
+  }
+
+  function disconnectMultiplayer(returnToMenu) {
+    teardownSession();
+    multiplayer.active = false;
+    multiplayer.connected = false;
+    multiplayer.session = null;
+    multiplayer.snapshot = null;
+    multiplayer.localId = '';
+    multiplayer.remotePlayers = [];
+    multiplayer.status = 'OFFLINE';
+    multiplayer.playerNotifs = [];
+    multiplayer.prevPlayerIds = null;
+    if (returnToMenu) {
+      const next = freshState();
+      next.phase = 'menu';
+      state = next;
+    }
+    syncMultiplayerPanel();
+  }
+
+  const NOTIF_DURATION_MS = 4000;
+
+  function diffPlayerSnapshot(snapshot) {
+    const newMap = new Map();
+    for (const p of Object.values(snapshot.players || {})) {
+      newMap.set(p.id, String(p.name || 'ANON').toUpperCase().slice(0, 18));
+    }
+
+    if (multiplayer.prevPlayerIds !== null) {
+      for (const [id, name] of newMap) {
+        if (!multiplayer.prevPlayerIds.has(id) && id !== multiplayer.localId) {
+          multiplayer.playerNotifs.push({ text: name + ' joined the game', joinedAt: Date.now(), type: 'join' });
+        }
+      }
+      for (const [id, name] of multiplayer.prevPlayerIds) {
+        if (!newMap.has(id) && id !== multiplayer.localId) {
+          multiplayer.playerNotifs.push({ text: name + ' left the game', joinedAt: Date.now(), type: 'leave' });
+        }
+      }
+    }
+
+    multiplayer.prevPlayerIds = newMap;
+    const cutoff = Date.now() - NOTIF_DURATION_MS;
+    multiplayer.playerNotifs = multiplayer.playerNotifs.filter(n => n.joinedAt > cutoff);
+  }
+
+  function connectMultiplayer(isHost) {
+    if (!multiplayer.available) return;
+    menu.playerName = (menu.playerName || 'ANON').slice(0, 16);
+    multiplayer.roomCode = (multiplayer.roomCode || Math.random().toString(36).slice(2, 8)).toUpperCase();
+    multiplayer.host = (multiplayer.host || location.host).trim();
+    disconnectMultiplayer(false);
+    multiplayer.active = true;
+    multiplayer.status = isHost ? 'HOSTING...' : 'JOINING...';
+    const handle = window.ShapescapeSession.startMultiplayer({
+      roomId: multiplayer.roomCode,
+      name: menu.playerName || 'ANON',
+      host: multiplayer.host,
+      onState: snapshot => {
+        multiplayer.snapshot = snapshot;
+        multiplayer.connected = true;
+        // session.handle is assigned synchronously after createSession returns; our
+        // subscribe() callback is deferred (queueMicrotask) so it's always ready here.
+        multiplayer.localId = session.handle ? session.handle.getLocalId() : multiplayer.localId;
+        session.localId = multiplayer.localId;
+        // Non-hosts mirror the host's match type so the lobby UI stays in sync.
+        if (snapshot && snapshot.mode && snapshot.hostId && snapshot.hostId !== multiplayer.localId) {
+          multiplayer.mode = snapshot.mode;
+        }
+        diffPlayerSnapshot(snapshot);
+        applyMultiplayerSnapshot(snapshot);
+        syncMultiplayerPanel();
+      },
+      onStatus: status => {
+        multiplayer.status = status.toUpperCase();
+        syncMultiplayerPanel();
+      }
+    });
+    multiplayer.session = handle;
+    session.active = true;
+    session.handle = handle;
+    session.kind = 'network';
+    syncMultiplayerPanel();
+  }
+
+  function loadCrtPreference() {
+    try {
+      return localStorage.getItem(CRT_PREF_KEY) !== '0';
+    } catch (err) {
+      return true;
+    }
+  }
+
+  function saveCrtPreference(enabled) {
+    try {
+      localStorage.setItem(CRT_PREF_KEY, enabled ? '1' : '0');
+    } catch (err) {}
+  }
+
+  function applyCrtMode() {
+    const enabled = !!menu.crtEnabled;
+    const hasWebglCrt = !!crtRenderer;
+    container.classList.toggle('crt-on', enabled);
+    container.classList.toggle('crt-webgl', hasWebglCrt);
+    if (crtRenderer) crtRenderer.setEnabled(enabled);
+  }
+
+  if (window.CRTPostProcess && crtCanvas) {
+    try {
+      const renderer = new window.CRTPostProcess(canvas, crtCanvas);
+      if (renderer.supported) crtRenderer = renderer;
+    } catch (err) {
+      crtRenderer = null;
+    }
+  }
+  menu.crtSupported = !!crtRenderer;
+  menu.crtEnabled = menu.crtSupported && loadCrtPreference();
+  applyCrtMode();
+  if (crtRenderer) resizeCanvas();
+
   function getMenuItems() {
-    const items = ['start', 'name'];
+    const items = ['mode', 'start', 'name'];
+    if (menu.multiplayerMode) {
+      items.push('mp_room', 'mp_host', 'mp_matchmode', 'mp_join', 'mp_leave', 'mp_status');
+    }
+    items.push('crt');
     for (const cat of CHEAT_CATEGORIES) {
       items.push('cat_' + cat.id);
       if (menu.expanded[cat.id]) {
@@ -217,26 +759,66 @@
     const rows = [];
     let y = titleY + (compact ? 42 : 60);
     let firstCat = true;
+    let prevHalf = 0;
+    let prevItem = null;
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      if (item === 'name') y += 30;
-      if (item.startsWith('cat_')) { y += firstCat ? 30 : 10; firstCat = false; }
+      const thisHalf = getMenuRowHeight(item) / 2;
+      let gap;
+      if (item.startsWith('cheat_')) gap = 4;
+      else if (item === 'name') gap = 28;
+      else if (item === 'mp_room') gap = 44;
+      else if (item === 'mp_status') gap = 10;
+      else if (item.startsWith('cat_')) { gap = firstCat ? 28 : 10; firstCat = false; }
+      else gap = 6;
+      if (prevItem === 'mp_status') gap = Math.max(gap, 28);
+      y += (i === 0 ? 0 : prevHalf + gap) + thisHalf;
       rows.push({ y, item });
-      if (item.startsWith('cheat_')) y += 24;
-      else y += 38;
+      prevHalf = thisHalf;
+      prevItem = item;
     }
     return rows;
   }
 
+  function getMenuContentHeight() {
+    const layout = getMenuLayout();
+    if (!layout.length) return 0;
+    const last = layout[layout.length - 1];
+    const bottom = last.y + getMenuRowHeight(last.item) / 2;
+    return bottom + 40;
+  }
+
+  function getMenuMaxScroll() {
+    const contentHeight = getMenuContentHeight();
+    return Math.max(0, contentHeight - H + 40);
+  }
+
   function getMenuScrollY() {
+    normalizeMenuSelection();
     const layout = getMenuLayout();
     const maxVisibleY = H - 60;
+    const maxScroll = getMenuMaxScroll();
+    if (menu.userScrolled) {
+      // User-driven scroll (wheel / touch drag) takes precedence until they
+      // use keyboard navigation, which resets userScrolled and falls back to
+      // the selection-driven auto-scroll below.
+      menu.scrollY = Math.max(0, Math.min(menu.scrollY, maxScroll));
+      return menu.scrollY;
+    }
     let scrollY = 0;
     if (layout.length > 0) {
       const selRow = layout[Math.min(menu.selectedIndex, layout.length - 1)];
       if (selRow && selRow.y > maxVisibleY) scrollY = selRow.y - maxVisibleY + 40;
     }
-    return scrollY;
+    menu.scrollY = Math.max(0, Math.min(scrollY, maxScroll));
+    return menu.scrollY;
+  }
+
+  function adjustMenuScroll(deltaY) {
+    const maxScroll = getMenuMaxScroll();
+    if (maxScroll <= 0) return;
+    menu.userScrolled = true;
+    menu.scrollY = Math.max(0, Math.min(menu.scrollY + deltaY, maxScroll));
   }
 
   // menu rows are capped at 400px wide so they don't stretch on big screens
@@ -264,66 +846,18 @@
     }
   }
 
-  // dreamlo is http-only with no CORS — use same-origin /api/dreamlo proxy on https (Vercel)
-  function dreamloUrl(path) {
-    const direct = 'http://dreamlo.com/lb/' + path;
-    if (location.protocol === 'https:') {
-      return '/api/dreamlo?path=' + encodeURIComponent(path);
-    }
-    return direct;
-  }
-
-  function formatLeaderboardTime(totalSec) {
-    const s = Math.max(0, Math.floor(totalSec));
-    const m = Math.floor(s / 60);
-    const r = s % 60;
-    const minStr = m < 100 ? String(m).padStart(2, '0') : String(m);
-    return minStr + ':' + String(r).padStart(2, '0');
-  }
-
-  function fetchLeaderboard() {
-    if (!DREAMLO_PUBLIC || menu.lbLoading) return;
-    const now = Date.now();
-    if (now - menu.lbLastFetch < 15000) return;
-    menu.lbLoading = true;
-    menu.lbError = false;
-    const xhr = new XMLHttpRequest();
-    xhr.open('GET', dreamloUrl(DREAMLO_PUBLIC + '/pipe'));
-    xhr.onload = function () {
-      const lines = xhr.responseText.trim().split('\n').filter(Boolean);
-      menu.leaderboard = lines.slice(0, 10).map(function (line) {
-        const parts = line.split('|');
-        const timeRaw = parts[2];
-        const timeSec = timeRaw !== undefined && timeRaw !== '' ? parseInt(timeRaw, 10) : NaN;
-        return {
-          name: parts[0] || '???',
-          score: parseInt(parts[1], 10) || 0,
-          timeSec: Number.isFinite(timeSec) ? timeSec : null,
-        };
-      });
-      menu.lbLastFetch = Date.now();
-      menu.lbLoading = false;
-    };
-    xhr.onerror = function () { menu.lbError = true; menu.lbLoading = false; };
-    xhr.send();
-  }
-
-  function submitScore(name, score, timeSeconds) {
-    if (!DREAMLO_PRIVATE || !name || score <= 0) return;
-    const t = Math.max(0, Math.floor(timeSeconds || 0));
-    const path = DREAMLO_PRIVATE + '/add/' + encodeURIComponent(name) + '/' + score + '/' + t;
-    const xhr = new XMLHttpRequest();
-    xhr.open('GET', dreamloUrl(path));
-    xhr.onload = function () { menu.lbLastFetch = 0; fetchLeaderboard(); };
-    xhr.onerror = function () {};
-    xhr.send();
-  }
+  const fetchLeaderboard = function () { leaderboardApi.fetch(menu); };
+  const submitScore = function (name, score, timeSeconds) {
+    leaderboardApi.submit(menu, name, score, timeSeconds);
+  };
 
   // track mouse for drawing previews and tooltips
   let mouseWorld = { x: 0, y: 0 };
   let mouseScreen = { x: 0, y: 0 };
   let mouseOnCanvas = false;
   let mouseHeld = false;
+  /** True while Option/Alt is held — used for touch (no altKey on move) and previews. */
+  let drawSnapAltHeld = false;
 
   // game state — reset to this on new game
   let state = null;
@@ -332,32 +866,31 @@
     return {
       phase: 'menu',
       playerX: 50, playerY: 0, playerVY: 0,
-      onGround: true, airJumpsUsed: 0,
-      movingLeft: false, movingRight: false, sprinting: false,
+      onGround: true,
+      movingLeft: false, movingRight: false, sprinting: false, crouching: false,
+      mobileCrouch: false, mobileSprintHeld: false, mobileJumpHeld: false,
       direction: 'right',
       idleImg: idleImages[Math.floor(Math.random() * 3)],
       cameraX: 0,
+      cameraY: 0,
       squares: [],
       isDragging: false, dragStart: null, dragCurrent: null,
-      score: 0, coins: [], lastCoinSpawn: 0,
-      hearts: [], lastHeartSpawn: 0,
-      upgrades: [], lastUpgradeSpawn: 0,
+      score: 0, coins: [],
+      hearts: [],
+      upgrades: [],
       activeUpgrades: {},
       health: 100, gameStartTime: 0,
-      fish: { x: -200, y: 200, speed: 0.4, spawned: false, rotation: 0, lastShot: 0, touchCd: 0 },
-      fishHP: 100, fishMaxHP: 100, fishRespawnTime: 0,
+      fish: { x: -200, y: 200, spawned: false, rotation: 0 },
+      fishHP: 100, fishMaxHP: 100,
       projectiles: [],
       inventory: ['square'],
       selectedSlot: 0,
       portals: [],
-      portalCooldown: 0,
       portalBoostVX: 0,
       swordCooldown: 0,
       swordSwing: null,
       bugs: [],
-      lastBugSpawn: 0,
       danglies: [],
-      lastDanglySpawn: 0,
       polyPoints: [],
       bezierPoints: [],
       grapple: null,
@@ -366,15 +899,14 @@
       reflectorCooldown: 0,
       bombs: [],
       bombCooldown: 0,
+      revives: [],
       fishShootPulse: 0,
       fishFrozen: 0,
       freezeCooldown: 0,
       iceShards: [],
       laserCooldown: 0,
       laserBeams: [],
-      dashCooldown: 0,
       dashActive: 0,
-      regenTick: 0,
       damageFlash: 0,
       pauseStart: 0,
       particles: [],
@@ -383,33 +915,171 @@
 
   state = freshState();
 
+  // Snapshot → legacy render-state is implemented in TypeScript
+  // (src/client/render-adapter.ts) so the mapping is typed and testable. This
+  // wrapper only handles phase-transition policy and idle-sprite preservation,
+  // which depend on game.js-local state (idleImages, onGameOver, pause clock)
+  function applyMultiplayerSnapshot(snapshot) {
+    if (!snapshot) return;
+    if (snapshot.phase === 'lobby') {
+      state.phase = 'menu';
+      multiplayer.remotePlayers = [];
+      return;
+    }
+    // Let a multiplayer match pull us out of the main menu once the host kicks it off.
+    // Solo mode flips `state.phase` to 'playing' inside startGame() before the first
+    // snapshot arrives, so this path only matters for network sessions.
+    if (state.phase === 'menu') {
+      if (!(multiplayer.active && snapshot.phase === 'playing')) return;
+      const base = freshState();
+      base.phase = 'playing';
+      base.gameStartTime = Date.now();
+      state = base;
+    }
+    if (state.phase === 'paused') return;
+    // Host-triggered "NEW MATCH" flips the server straight from gameover to
+    // playing — pull any still-on-the-scoreboard clients into the new round
+    // instead of keeping them locked on their old gameover screen.
+    if (state.phase === 'gameover' && snapshot.phase === 'playing') {
+      const base = freshState();
+      base.phase = 'playing';
+      base.gameStartTime = Date.now();
+      state = base;
+    }
+    if (state.phase === 'gameover' && snapshot.phase !== 'gameover') return;
+
+    const adapter = window.ShapescapeSession && window.ShapescapeSession.toRenderState;
+    if (!adapter) return;
+    const result = adapter(snapshot, multiplayer.localId || session.localId, W, H);
+    if (!result) return;
+
+    const prevPhase = state.phase;
+    const next = result.next;
+
+    // Preserve draw-in-progress + idle sprite across frames.
+    next.isDragging = state.isDragging;
+    next.dragStart = state.dragStart;
+    next.dragCurrent = state.dragCurrent;
+    next.polyPoints = state.polyPoints;
+    next.bezierPoints = state.bezierPoints;
+    if (next.movingLeft || next.movingRight) {
+      next.idleImg = idleImages[Math.floor(Math.random() * idleImages.length)];
+    } else if (state.idleImg) {
+      next.idleImg = state.idleImg;
+    }
+    next.particles = state.particles || [];
+    next.mobileCrouch = state.mobileCrouch;
+    next.mobileSprintHeld = state.mobileSprintHeld;
+    next.mobileJumpHeld = state.mobileJumpHeld;
+    next.portalBoostVX = state.portalBoostVX || 0;
+    next.pauseStart = state.pauseStart || 0;
+
+    state = next;
+    multiplayer.remotePlayers = result.remotePlayers;
+    if (prevPhase !== 'gameover' && next.phase === 'gameover') {
+      onGameOver();
+    }
+  }
+
+  function isSprintActive() {
+    return (state.sprinting || state.mobileSprintHeld) && state.activeUpgrades.sprint;
+  }
+
+  function pauseGameplay() {
+    if (state.phase !== 'playing') return;
+    state.phase = 'paused';
+    state.pauseStart = Date.now();
+    state.movingLeft = false;
+    state.movingRight = false;
+    state.sprinting = false;
+    state.mobileSprintHeld = false;
+    state.mobileCrouch = false;
+    state.mobileJumpHeld = false;
+    if (sessionActive() && session.handle && session.handle.setPaused) session.handle.setPaused(true);
+  }
+
+  function resumeFromPause() {
+    if (state.phase !== 'paused') return;
+    // shift the HUD timer forward so the wall-clock pause doesn't count as playtime;
+    // every other timer lives in the sim (LocalSession/NetworkSession), which is paused via setPaused.
+    state.gameStartTime += Date.now() - state.pauseStart;
+    state.phase = 'playing';
+    if (sessionActive() && session.handle && session.handle.setPaused) session.handle.setPaused(false);
+  }
+
+  function quitToMenuFromPause() {
+    if (state.phase !== 'paused') return;
+    if (multiplayer.active) {
+      disconnectMultiplayer(true);
+      return;
+    }
+    if (sessionActive() && session.kind === 'local') teardownSession();
+    state.phase = 'menu';
+  }
+
   function getCurrentTool() {
     return state.inventory[state.selectedSlot] || 'square';
   }
 
   // keyboard input
   const keys = {};
+  const DOUBLE_TAP_MS = 280;
+  let lastKeyDirDoubleTap = { side: null, t: 0 };
 
   window.addEventListener('keydown', e => {
     if (e.repeat && state.phase !== 'menu') return;
     keys[e.code] = true;
+    if (e.code === 'AltLeft' || e.code === 'AltRight') drawSnapAltHeld = true;
+
+    if (isTypingInField() && state.phase === 'menu' && !menu.activeField) return;
 
     if (state.phase === 'menu') {
-      if (menu.nameActive) {
-        if (e.code === 'Escape' || e.code === 'Enter' || e.code === 'Tab') {
-          menu.nameActive = false; e.preventDefault(); return;
+      if (menu.activeField) {
+        if (e.code === 'Escape' || e.code === 'Enter') {
+          setActiveField(''); e.preventDefault(); return;
         }
-        if (e.code === 'Backspace') { menu.playerName = menu.playerName.slice(0, -1); e.preventDefault(); return; }
-        if (e.key.length === 1 && menu.playerName.length < 16) { menu.playerName += e.key; e.preventDefault(); return; }
+        if (e.code === 'Tab') {
+          const prevIdx = menu.selectedIndex;
+          setActiveField('');
+          moveMenuSelection(e.shiftKey ? -1 : 1);
+          if (menu.selectedIndex !== prevIdx) triggerGlitch();
+          e.preventDefault();
+          return;
+        }
+        // When the hidden DOM input has focus (desktop or mobile) let it handle
+        // character entry via its own input event so we don't double-type.
+        if (menuTextInputFocused()) return;
+        if (e.code === 'Backspace') {
+          setMenuTextValue(menu.activeField, getMenuTextValue(menu.activeField).slice(0, -1));
+          e.preventDefault();
+          return;
+        }
+        if (e.key.length === 1) {
+          setMenuTextValue(menu.activeField, getMenuTextValue(menu.activeField) + e.key);
+          e.preventDefault();
+          return;
+        }
         return;
       }
+      normalizeMenuSelection();
       const prevIdx = menu.selectedIndex;
       const curItems = getMenuItems();
+      if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
+        const item = curItems[menu.selectedIndex];
+        if (item === 'mode') {
+          setMenuMultiplayerMode(e.code === 'ArrowRight');
+          e.preventDefault();
+          return;
+        }
+      }
       if (e.code === 'ArrowUp' || e.code === 'KeyW') {
-        menu.selectedIndex = (menu.selectedIndex - 1 + curItems.length) % curItems.length;
+        moveMenuSelection(-1);
         e.preventDefault();
       } else if (e.code === 'ArrowDown' || e.code === 'KeyS') {
-        menu.selectedIndex = (menu.selectedIndex + 1) % curItems.length;
+        moveMenuSelection(1);
+        e.preventDefault();
+      } else if (e.code === 'Tab') {
+        moveMenuSelection(e.shiftKey ? -1 : 1);
         e.preventDefault();
       } else if (e.code === 'Enter' || e.code === 'Space') {
         activateMenuItem(curItems[menu.selectedIndex]);
@@ -420,73 +1090,155 @@
     }
 
     if (state.phase === 'gameover' && e.code === 'Enter') {
+      if (sessionActive() && session.kind === 'local') teardownSession();
       state.phase = 'menu'; e.preventDefault(); return;
     }
 
     if (state.phase === 'playing' && e.code === 'Escape') {
-      state.phase = 'paused';
-      state.pauseStart = Date.now();
-      state.movingLeft = false; state.movingRight = false; state.sprinting = false;
+      pauseGameplay();
+      if (sessionActive()) {
+        for (const k in session.input) session.input[k] = false;
+        sessionSendInput();
+      }
       e.preventDefault(); return;
     }
 
     if (state.phase === 'paused') {
       if (e.code === 'Escape' || e.code === 'Enter' || e.code === 'Space') {
-        const pausedMs = Date.now() - state.pauseStart;
-        state.gameStartTime += pausedMs;
-        state.lastCoinSpawn += pausedMs;
-        state.lastHeartSpawn += pausedMs;
-        state.lastUpgradeSpawn += pausedMs;
-        state.lastBugSpawn += pausedMs;
-        state.lastDanglySpawn += pausedMs;
-        if (state.fish.lastShot) state.fish.lastShot += pausedMs;
-        if (state.fishRespawnTime > 0) state.fishRespawnTime += pausedMs;
-        state.phase = 'playing';
+        resumeFromPause();
         e.preventDefault(); return;
       }
       if (e.code === 'KeyQ') {
-        state.phase = 'menu';
+        quitToMenuFromPause();
         e.preventDefault(); return;
       }
       return;
     }
 
     if (state.phase === 'playing') {
-      if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') { tryJump(); e.preventDefault(); }
-      if (e.code === 'ArrowLeft' || e.code === 'KeyA') { state.movingLeft = true; e.preventDefault(); }
-      if (e.code === 'ArrowRight' || e.code === 'KeyD') { state.movingRight = true; e.preventDefault(); }
-      if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') state.sprinting = true;
-      if (e.code === 'KeyE' && state.activeUpgrades.dash && state.dashCooldown <= 0) {
-        state.dashActive = 8;
-        state.dashCooldown = 60;
-      }
-
-      // Inventory slot keys 1-9
-      const num = parseInt(e.key);
-      if (num >= 1 && num <= 9 && num <= state.inventory.length) {
-        state.selectedSlot = num - 1;
-        e.preventDefault();
+      if (sessionActive()) {
+        if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') { session.input.jump = true; sessionSendInput(); e.preventDefault(); }
+        if (e.code === 'ArrowLeft' || e.code === 'KeyA') {
+          const now = Date.now();
+          if (lastKeyDirDoubleTap.side === 'left' && now - lastKeyDirDoubleTap.t < DOUBLE_TAP_MS) {
+            session.input.dash = true; sessionSendInput();
+            setTimeout(() => { session.input.dash = false; sessionSendInput(); }, 80);
+            lastKeyDirDoubleTap = { side: null, t: 0 };
+          } else {
+            lastKeyDirDoubleTap = { side: 'left', t: now };
+          }
+          session.input.left = true; sessionSendInput(); e.preventDefault();
+        }
+        if (e.code === 'ArrowRight' || e.code === 'KeyD') {
+          const now = Date.now();
+          if (lastKeyDirDoubleTap.side === 'right' && now - lastKeyDirDoubleTap.t < DOUBLE_TAP_MS) {
+            session.input.dash = true; sessionSendInput();
+            setTimeout(() => { session.input.dash = false; sessionSendInput(); }, 80);
+            lastKeyDirDoubleTap = { side: null, t: 0 };
+          } else {
+            lastKeyDirDoubleTap = { side: 'right', t: now };
+          }
+          session.input.right = true; sessionSendInput(); e.preventDefault();
+        }
+        if (e.code === 'KeyS' || e.code === 'ArrowDown' || e.code === 'KeyC') { session.input.crouch = true; sessionSendInput(); e.preventDefault(); }
+        if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') { session.input.sprint = true; sessionSendInput(); }
+        if (e.code === 'KeyE') {
+          session.input.dash = true; sessionSendInput();
+          setTimeout(() => { session.input.dash = false; sessionSendInput(); }, 80);
+        }
+        const num = parseInt(e.key, 10);
+        if (num >= 1 && num <= 9 && num <= state.inventory.length) {
+          const tool = state.inventory[num - 1];
+          sessionSend({ type: 'selectTool', tool: tool });
+          e.preventDefault();
+        }
       }
     }
   });
 
   window.addEventListener('keyup', e => {
     keys[e.code] = false;
-    if (e.code === 'ArrowLeft' || e.code === 'KeyA') state.movingLeft = false;
-    if (e.code === 'ArrowRight' || e.code === 'KeyD') state.movingRight = false;
-    if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') state.sprinting = false;
+    if (e.code === 'AltLeft' || e.code === 'AltRight') drawSnapAltHeld = false;
+    if (!sessionActive() || state.phase !== 'playing') return;
+    if (e.code === 'ArrowLeft' || e.code === 'KeyA') session.input.left = false;
+    if (e.code === 'ArrowRight' || e.code === 'KeyD') session.input.right = false;
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') session.input.jump = false;
+    if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') session.input.sprint = false;
+    if (e.code === 'KeyS' || e.code === 'ArrowDown' || e.code === 'KeyC') session.input.crouch = false;
+    sessionSendInput();
   });
 
-  // Scroll wheel to cycle inventory
+  window.addEventListener('blur', () => { drawSnapAltHeld = false; });
+
+  // Scroll wheel: cycle inventory while playing, scroll the menu otherwise.
   canvas.addEventListener('wheel', e => {
-    if (state.phase !== 'playing' || state.inventory.length <= 1) return;
+    if (state.phase === 'menu') {
+      e.preventDefault();
+      adjustMenuScroll(e.deltaY);
+      return;
+    }
+    if (!sessionActive() || state.phase !== 'playing' || state.inventory.length <= 1) return;
     e.preventDefault();
-    if (e.deltaY > 0) state.selectedSlot = (state.selectedSlot + 1) % state.inventory.length;
-    else state.selectedSlot = (state.selectedSlot - 1 + state.inventory.length) % state.inventory.length;
+    const nextIdx = e.deltaY > 0
+      ? (state.selectedSlot + 1) % state.inventory.length
+      : (state.selectedSlot - 1 + state.inventory.length) % state.inventory.length;
+    sessionSend({ type: 'selectTool', tool: state.inventory[nextIdx] });
   }, { passive: false });
 
+  function setMenuMultiplayerMode(wantMp) {
+    if (menu.multiplayerMode === wantMp) return;
+    menu.multiplayerMode = wantMp;
+    if (!menu.multiplayerMode && multiplayer.active && state.phase === 'menu') disconnectMultiplayer(false);
+    syncMultiplayerPanel();
+    triggerGlitch();
+    normalizeMenuSelection();
+  }
+
   function activateMenuItem(item) {
-    if (item === 'name') { menu.nameActive = true; return; }
+    if (item === 'mode') {
+      setActiveField('');
+      setMenuMultiplayerMode(!menu.multiplayerMode);
+      return;
+    }
+    if (isMenuTextItem(item)) {
+      if ((item === 'mp_room' || item === 'mp_host') && multiplayer.active) return;
+      setActiveField(item);
+      return;
+    }
+    setActiveField('');
+    if (item === 'mp_matchmode') {
+      if (isMatchModeLocked()) return;
+      multiplayer.mode = multiplayer.mode === 'pvp' ? 'coop' : 'pvp';
+      if (multiplayer.session && multiplayer.snapshot && multiplayer.snapshot.hostId === multiplayer.localId) {
+        multiplayer.session.send({ type: 'setMode', mode: multiplayer.mode });
+      }
+      triggerGlitch();
+      return;
+    }
+    if (item === 'mp_join') {
+      if (multiplayer.active) return;
+      if (!multiplayer.roomCode) {
+        setActiveField('mp_room');
+        multiplayer.status = 'ENTER ROOM CODE';
+      } else {
+        connectMultiplayer(false);
+      }
+      triggerGlitch();
+      return;
+    }
+    if (item === 'mp_leave') {
+      if (multiplayer.active) disconnectMultiplayer(true);
+      triggerGlitch();
+      return;
+    }
+    if (item === 'crt') {
+      if (!menu.crtSupported) return;
+      menu.crtEnabled = !menu.crtEnabled;
+      saveCrtPreference(menu.crtEnabled);
+      applyCrtMode();
+      triggerGlitch();
+      return;
+    }
     if (item.startsWith('cat_')) {
       const catId = item.slice(4);
       menu.expanded[catId] = !menu.expanded[catId];
@@ -499,14 +1251,41 @@
       triggerGlitch();
       return;
     }
-    if (item === 'start') startGame();
+    if (item === 'start') activateStartAction();
   }
 
   // mouse and touch input
   function canvasCoords(clientX, clientY) {
     const rect = canvas.getBoundingClientRect();
     const scaleX = W / rect.width, scaleY = H / rect.height;
-    return { x: (clientX - rect.left) * scaleX + state.cameraX, y: H - (clientY - rect.top) * scaleY };
+    return {
+      x: (clientX - rect.left) * scaleX + state.cameraX,
+      y: H - (clientY - rect.top) * scaleY + (state.cameraY || 0)
+    };
+  }
+
+  function snapWorldPointToGrid(p) {
+    return {
+      x: Math.round(p.x / DRAW_SNAP_GRID) * DRAW_SNAP_GRID,
+      y: Math.round(p.y / DRAW_SNAP_GRID) * DRAW_SNAP_GRID,
+    };
+  }
+
+  /**
+   * Option/Alt: snap drag end to grid for box shapes; snap line to nearest 45° from drag start.
+   */
+  function snapDragEndForTool(start, rawEnd, tool, snap) {
+    if (!snap) return rawEnd;
+    if (tool === 'line') {
+      const dx = rawEnd.x - start.x, dy = rawEnd.y - start.y;
+      const len = Math.hypot(dx, dy);
+      if (len < 1e-6) return snapWorldPointToGrid(rawEnd);
+      let ang = Math.atan2(dy, dx);
+      const step = Math.PI / 4;
+      ang = Math.round(ang / step) * step;
+      return { x: start.x + Math.cos(ang) * len, y: start.y + Math.sin(ang) * len };
+    }
+    return snapWorldPointToGrid(rawEnd);
   }
 
   function screenCoords(clientX, clientY) {
@@ -514,149 +1293,217 @@
     return { x: (clientX - rect.left) * (W / rect.width), y: (clientY - rect.top) * (H / rect.height) };
   }
 
+  function getPausePanelRect() {
+    const w = Math.min(360, W - 40), h = 180;
+    return { x: (W - w) / 2, y: (H - h) / 2, w, h };
+  }
+
+  /** Same breakpoint as `#mobile-controls` in style.css — touch / narrow viewports. */
+  function isMobilePauseHints() {
+    try {
+      return window.matchMedia('(pointer: coarse), (max-width: 600px)').matches;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function handlePauseScreenPointer(clientX, clientY) {
+    if (state.phase !== 'paused') return;
+    const sc = screenCoords(clientX, clientY);
+    const r = getPausePanelRect();
+    const inside = sc.x >= r.x && sc.x <= r.x + r.w && sc.y >= r.y && sc.y <= r.y + r.h;
+    if (inside) quitToMenuFromPause();
+    else resumeFromPause();
+  }
+
   canvas.addEventListener('mousemove', e => {
     mouseOnCanvas = true;
     mouseWorld = canvasCoords(e.clientX, e.clientY);
     mouseScreen = screenCoords(e.clientX, e.clientY);
-    if (state.isDragging) state.dragCurrent = canvasCoords(e.clientX, e.clientY);
+    if (state.isDragging && state.dragStart) {
+      const raw = canvasCoords(e.clientX, e.clientY);
+      const tool = getCurrentTool();
+      state.dragCurrent = snapDragEndForTool(state.dragStart, raw, tool, e.altKey);
+    }
   });
-  canvas.addEventListener('mouseleave', () => { mouseOnCanvas = false; releaseGrapple(); finishDrag(); });
+  canvas.addEventListener('mouseleave', () => { mouseOnCanvas = false; finishDrag(); });
 
   canvas.addEventListener('mousedown', e => {
     mouseHeld = true;
-    if (state.phase === 'menu') { handleMenuClick(e); return; }
-    if (state.phase === 'gameover') { state.phase = 'menu'; return; }
+    if (state.phase === 'menu') {
+      // Prevent default so the browser doesn't move focus to <body>/canvas and
+      // clobber the .focus() call in setActiveField(). Without this, clicking
+      // a text field on desktop never actually focuses the hidden input.
+      e.preventDefault();
+      handleMenuClick(e);
+      return;
+    }
+    if (state.phase === 'gameover') {
+      if (sessionActive() && session.kind === 'local') teardownSession();
+      state.phase = 'menu'; return;
+    }
+    if (state.phase === 'paused') {
+      handlePauseScreenPointer(e.clientX, e.clientY);
+      e.preventDefault();
+      return;
+    }
     if (state.phase !== 'playing') return;
 
     const tool = getCurrentTool();
-    const p = canvasCoords(e.clientX, e.clientY);
+    const pRaw = canvasCoords(e.clientX, e.clientY);
+    const snapPt = e.altKey ? snapWorldPointToGrid(pRaw) : pRaw;
 
     if (tool === 'square' || tool === 'circle' || tool === 'triangle' || tool === 'line') {
-      state.isDragging = true; state.dragStart = p; state.dragCurrent = p;
+      state.isDragging = true; state.dragStart = snapPt; state.dragCurrent = snapPt;
     } else if (tool === 'polygon') {
-      handlePolygonClick(p);
+      handlePolygonClick(snapPt);
     } else if (tool === 'bezier') {
-      handleBezierClick(p);
+      handleBezierClick(snapPt);
     } else if (tool === 'eraser') {
-      eraseAtPoint(p);
+      eraseAtPoint(snapPt);
     } else if (tool === 'portal') {
-      placePortal(p);
+      placePortal(snapPt);
     } else if (tool === 'sword') {
       triggerSwordSwing();
     } else if (tool === 'grapple') {
-      activateGrapple(p);
+      activateGrapple(snapPt);
     } else if (tool === 'reflector') {
-      placeReflector(p);
+      placeReflector(snapPt);
     } else if (tool === 'bomb') {
-      placeBomb(p);
+      placeBomb(snapPt);
     } else if (tool === 'freeze') {
-      activateFreeze(p);
+      activateFreeze(snapPt);
     } else if (tool === 'laser') {
-      fireLaser(p);
+      fireLaser(snapPt);
     }
   });
-  canvas.addEventListener('mouseup', () => { mouseHeld = false; releaseGrapple(); finishDrag(); });
+  canvas.addEventListener('mouseup', () => { mouseHeld = false; finishDrag(); });
   window.addEventListener('mouseup', () => { mouseHeld = false; });
 
+  // Track touch drag in the menu so we can differentiate a tap (activate row)
+  // from a scroll gesture (drag the menu up/down on mobile).
+  let menuTouchDrag = null;
+  const MENU_TOUCH_TAP_PX = 8;
   canvas.addEventListener('touchstart', e => {
     e.preventDefault();
     mouseHeld = true;
     if (state.phase === 'menu') {
       if (e.touches.length) {
         const t = e.touches[0];
-        handleMenuClick({ clientX: t.clientX, clientY: t.clientY });
+        menuTouchDrag = {
+          startX: t.clientX,
+          startY: t.clientY,
+          lastY: t.clientY,
+          moved: false,
+          scale: (H / canvas.getBoundingClientRect().height) || 1
+        };
       }
       return;
     }
-    if (state.phase === 'gameover') { state.phase = 'menu'; return; }
+    if (state.phase === 'gameover') {
+      if (sessionActive() && session.kind === 'local') teardownSession();
+      state.phase = 'menu'; return;
+    }
+    if (state.phase === 'paused' && e.touches.length) {
+      const t = e.touches[0];
+      handlePauseScreenPointer(t.clientX, t.clientY);
+      return;
+    }
     if (state.phase !== 'playing' || !e.touches.length) return;
     const t = e.touches[0];
     const tool = getCurrentTool();
-    const p = canvasCoords(t.clientX, t.clientY);
+    const pRaw = canvasCoords(t.clientX, t.clientY);
+    const snapPt = drawSnapAltHeld ? snapWorldPointToGrid(pRaw) : pRaw;
     if (tool === 'square' || tool === 'circle' || tool === 'triangle' || tool === 'line') {
-      state.isDragging = true; state.dragStart = p; state.dragCurrent = p;
+      state.isDragging = true; state.dragStart = snapPt; state.dragCurrent = snapPt;
     } else if (tool === 'polygon') {
-      handlePolygonClick(p);
+      handlePolygonClick(snapPt);
     } else if (tool === 'bezier') {
-      handleBezierClick(p);
+      handleBezierClick(snapPt);
     } else if (tool === 'eraser') {
-      eraseAtPoint(p);
+      eraseAtPoint(snapPt);
     } else if (tool === 'portal') {
-      placePortal(p);
+      placePortal(snapPt);
     } else if (tool === 'sword') {
       triggerSwordSwing();
     } else if (tool === 'grapple') {
-      activateGrapple(p);
+      activateGrapple(snapPt);
     } else if (tool === 'reflector') {
-      placeReflector(p);
+      placeReflector(snapPt);
     } else if (tool === 'bomb') {
-      placeBomb(p);
+      placeBomb(snapPt);
     } else if (tool === 'freeze') {
-      activateFreeze(p);
+      activateFreeze(snapPt);
     } else if (tool === 'laser') {
-      fireLaser(p);
+      fireLaser(snapPt);
     }
   }, { passive: false });
   canvas.addEventListener('touchmove', e => {
     e.preventDefault();
-    if (!state.isDragging || !e.touches.length) return;
-    state.dragCurrent = canvasCoords(e.touches[0].clientX, e.touches[0].clientY);
+    if (state.phase === 'menu' && menuTouchDrag && e.touches.length) {
+      const t = e.touches[0];
+      const dx = t.clientX - menuTouchDrag.startX;
+      const dy = t.clientY - menuTouchDrag.startY;
+      if (Math.hypot(dx, dy) > MENU_TOUCH_TAP_PX) menuTouchDrag.moved = true;
+      const delta = menuTouchDrag.lastY - t.clientY;
+      adjustMenuScroll(delta * menuTouchDrag.scale);
+      menuTouchDrag.lastY = t.clientY;
+      return;
+    }
+    if (!state.isDragging || !e.touches.length || !state.dragStart) return;
+    const raw = canvasCoords(e.touches[0].clientX, e.touches[0].clientY);
+    state.dragCurrent = snapDragEndForTool(state.dragStart, raw, getCurrentTool(), drawSnapAltHeld);
   }, { passive: false });
-  canvas.addEventListener('touchend', e => { e.preventDefault(); mouseHeld = false; releaseGrapple(); finishDrag(); }, { passive: false });
-  canvas.addEventListener('touchcancel', e => { e.preventDefault(); mouseHeld = false; releaseGrapple(); finishDrag(); }, { passive: false });
+  canvas.addEventListener('touchend', e => {
+    e.preventDefault();
+    mouseHeld = false;
+    if (state.phase === 'menu' && menuTouchDrag) {
+      if (!menuTouchDrag.moved) {
+        handleMenuClick({ clientX: menuTouchDrag.startX, clientY: menuTouchDrag.startY });
+      }
+      menuTouchDrag = null;
+      return;
+    }
+    finishDrag();
+  }, { passive: false });
+  canvas.addEventListener('touchcancel', e => {
+    e.preventDefault();
+    mouseHeld = false;
+    menuTouchDrag = null;
+    finishDrag();
+  }, { passive: false });
 
   function finishDrag() {
     if (!state.isDragging || !state.dragStart || !state.dragCurrent) {
       state.isDragging = false; state.dragStart = null; state.dragCurrent = null; return;
     }
     const tool = getCurrentTool();
-    const sx = Math.min(state.dragStart.x, state.dragCurrent.x);
-    const sy = Math.min(state.dragStart.y, state.dragCurrent.y);
     const w = Math.abs(state.dragCurrent.x - state.dragStart.x);
     const h = Math.abs(state.dragCurrent.y - state.dragStart.y);
-    let newShape = null;
 
+    // Size gates mirror src/sim/shapes.ts so we don't send drafts the server will silently reject.
+    let valid = false;
     if (tool === 'circle') {
-      const ccx = (state.dragStart.x + state.dragCurrent.x) / 2;
-      const ccy = (state.dragStart.y + state.dragCurrent.y) / 2;
-      const r = Math.min(w, h) / 2;
-      if (r > 4) {
-        newShape = { x: ccx - r, y: ccy - r, width: r * 2, height: r * 2, shape: 'circle', cx: ccx, cy: ccy, r: r, segments: generateCircleSegments(ccx, ccy, r) };
-      }
+      valid = Math.min(w, h) / 2 > 4;
     } else if (tool === 'triangle') {
-      if (w > 4 && h > 4) {
-        const tv1 = { x: sx + w / 2, y: sy + h };
-        const tv2 = { x: sx, y: sy };
-        const tv3 = { x: sx + w, y: sy };
-        newShape = {
-          x: sx, y: sy, width: w, height: h, shape: 'triangle',
-          v1: tv1, v2: tv2, v3: tv3,
-          segments: generateTriangleSegments(tv1, tv2, tv3),
-        };
-      }
+      valid = w > 4 && h > 4;
     } else if (tool === 'line') {
-      const ldx = state.dragCurrent.x - state.dragStart.x, ldy = state.dragCurrent.y - state.dragStart.y;
-      const len = Math.sqrt(ldx * ldx + ldy * ldy);
-      if (len > 8) {
-        const thickness = 6;
-        const segments = generateLineSegments(state.dragStart.x, state.dragStart.y, state.dragCurrent.x, state.dragCurrent.y, thickness);
-        const minX = Math.min(state.dragStart.x, state.dragCurrent.x) - thickness / 2;
-        const minY = Math.min(state.dragStart.y, state.dragCurrent.y) - thickness / 2;
-        const maxX = Math.max(state.dragStart.x, state.dragCurrent.x) + thickness / 2;
-        const maxY = Math.max(state.dragStart.y, state.dragCurrent.y) + thickness / 2;
-        newShape = {
-          x: minX, y: minY, width: maxX - minX, height: maxY - minY, shape: 'line',
-          x1: state.dragStart.x, y1: state.dragStart.y, x2: state.dragCurrent.x, y2: state.dragCurrent.y,
-          segments
-        };
-      }
+      const ldx = state.dragCurrent.x - state.dragStart.x;
+      const ldy = state.dragCurrent.y - state.dragStart.y;
+      valid = Math.sqrt(ldx * ldx + ldy * ldy) > 8;
     } else {
-      if (w > 4 && h > 4) newShape = { x: sx, y: sy, width: w, height: h, shape: 'rect' };
+      valid = w > 4 && h > 4;
     }
 
-    if (newShape) {
-      state.squares.push(newShape);
-      ejectPlayerFromShape(newShape);
+    if (valid && sessionActive()) {
+      sessionSend({
+        type: 'draw',
+        draft: {
+          tool: tool === 'square' ? 'square' : tool,
+          start: state.dragStart,
+          end: state.dragCurrent,
+        }
+      });
     }
     state.isDragging = false; state.dragStart = null; state.dragCurrent = null;
   }
@@ -681,8 +1528,18 @@
         slot.className = 'slot';
         slot.dataset.idx = i;
         slot.innerHTML = '<span class="slot-num">' + (i + 1) + '</span><span class="slot-icon">' + (def ? def.icon : '') + '</span><div class="slot-cd"></div>';
-        slot.addEventListener('mousedown', e => { e.stopPropagation(); state.selectedSlot = parseInt(slot.dataset.idx); });
-        slot.addEventListener('touchstart', e => { e.preventDefault(); e.stopPropagation(); state.selectedSlot = parseInt(slot.dataset.idx); }, { passive: false });
+        slot.addEventListener('mousedown', e => {
+          e.stopPropagation();
+          const idx = parseInt(slot.dataset.idx);
+          state.selectedSlot = idx;
+          if (sessionActive() && state.inventory[idx]) sessionSend({ type: 'selectTool', tool: state.inventory[idx] });
+        });
+        slot.addEventListener('touchstart', e => {
+          e.preventDefault(); e.stopPropagation();
+          const idx = parseInt(slot.dataset.idx);
+          state.selectedSlot = idx;
+          if (sessionActive() && state.inventory[idx]) sessionSend({ type: 'selectTool', tool: state.inventory[idx] });
+        }, { passive: false });
         hotbarEl.appendChild(slot);
       }
       // text label showing which tool is selected
@@ -714,19 +1571,15 @@
     }
   }
 
-  // portal gun — max 2 portals, oldest gets replaced
+  // Tool handlers just forward to the active session; simulation is authoritative.
   function placePortal(worldPos) {
-    if (state.portals.length >= 2) state.portals.shift();
-    state.portals.push({ x: worldPos.x, y: worldPos.y });
+    if (sessionActive()) sessionSend({ type: 'tool', action: 'portal', target: worldPos });
   }
 
-  // sword swing — one swing at a time, checks cooldown
   function triggerSwordSwing() {
-    if (state.swordCooldown > 0 || state.swordSwing) return;
-    state.swordSwing = { frame: 0, direction: state.direction, hit: false };
+    if (sessionActive()) sessionSend({ type: 'tool', action: 'sword' });
   }
 
-  // the remaining tool handlers
   function handlePolygonClick(p) {
     if (state.polyPoints.length >= 3) {
       const first = state.polyPoints[0];
@@ -738,16 +1591,9 @@
 
   function closePolygon() {
     const pts = state.polyPoints;
-    if (pts.length < 3) { state.polyPoints = []; return; }
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const p of pts) {
-      if (p.x < minX) minX = p.x; if (p.y < minY) minY = p.y;
-      if (p.x > maxX) maxX = p.x; if (p.y > maxY) maxY = p.y;
+    if (pts.length >= 3 && sessionActive()) {
+      sessionSend({ type: 'draw', draft: { tool: 'polygon', points: pts.slice() } });
     }
-    const verts = pts.slice();
-    const shape = { x: minX, y: minY, width: maxX - minX, height: maxY - minY, shape: 'polygon', vertices: verts, segments: generatePolygonSegments(verts) };
-    state.squares.push(shape);
-    ejectPlayerFromShape(shape);
     state.polyPoints = [];
   }
 
@@ -758,94 +1604,35 @@
 
   function closeBezier() {
     const pts = state.bezierPoints;
-    if (pts.length !== 3) { state.bezierPoints = []; return; }
-    const [p0, p2, p1] = pts;
-    const thickness = 6;
-    const segments = generateBezierSegments(p0, p1, p2, thickness);
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const seg of segments) {
-      if (seg.x < minX) minX = seg.x;
-      if (seg.y < minY) minY = seg.y;
-      if (seg.x + seg.width > maxX) maxX = seg.x + seg.width;
-      if (seg.y + seg.height > maxY) maxY = seg.y + seg.height;
+    if (pts.length === 3 && sessionActive()) {
+      const [p0, p2, p1] = pts;
+      sessionSend({ type: 'draw', draft: { tool: 'bezier', points: [p0, p1, p2] } });
     }
-    const shape = { x: minX, y: minY, width: maxX - minX, height: maxY - minY, shape: 'bezier', p0, p1, p2, segments };
-    state.squares.push(shape);
-    ejectPlayerFromShape(shape);
     state.bezierPoints = [];
   }
 
   function eraseAtPoint(worldPos) {
-    for (let i = state.squares.length - 1; i >= 0; i--) {
-      const s = state.squares[i];
-      if (worldPos.x >= s.x && worldPos.x <= s.x + s.width && worldPos.y >= s.y && worldPos.y <= s.y + s.height) {
-        state.squares.splice(i, 1);
-        return;
-      }
-    }
+    if (sessionActive()) sessionSend({ type: 'erase', point: worldPos });
   }
-
-  const GRAPPLE_MAX_RANGE = 400;
 
   function activateGrapple(worldPos) {
-    if (state.grappleCooldown > 0) return;
-    const pcx = state.playerX + CHAR_W / 2;
-    const pcy = -state.playerY + CHAR_H / 2;
-    let hitShape = null;
-    for (const s of state.squares) {
-      if (worldPos.x >= s.x && worldPos.x <= s.x + s.width &&
-          worldPos.y >= s.y && worldPos.y <= s.y + s.height) {
-        hitShape = s;
-        break;
-      }
-    }
-    if (!hitShape) return;
-    const clampX = Math.max(hitShape.x, Math.min(hitShape.x + hitShape.width, worldPos.x));
-    const clampY = Math.max(hitShape.y, Math.min(hitShape.y + hitShape.height, worldPos.y));
-    const dx = clampX - pcx, dy = clampY - pcy;
-    if (Math.sqrt(dx * dx + dy * dy) > GRAPPLE_MAX_RANGE) return;
-    state.grapple = { tx: clampX, ty: clampY, shape: hitShape };
-  }
-
-  function releaseGrapple() {
-    if (state.grapple) {
-      state.grapple = null;
-      state.grappleCooldown = 90;
-    }
+    if (sessionActive()) sessionSend({ type: 'tool', action: 'grapple', target: worldPos });
   }
 
   function placeReflector(worldPos) {
-    if (state.reflectorCooldown > 0) return;
-    if (state.reflectors.length >= 3) state.reflectors.shift();
-    const angle = Math.atan2(worldPos.y - (-state.playerY + CHAR_H / 2), worldPos.x - (state.playerX + CHAR_W / 2));
-    state.reflectors.push({ x: worldPos.x, y: worldPos.y, angle });
-    state.reflectorCooldown = 30;
+    if (sessionActive()) sessionSend({ type: 'tool', action: 'reflector', target: worldPos });
   }
 
   function placeBomb(worldPos) {
-    if (state.bombCooldown > 0) return;
-    state.bombs.push({ x: worldPos.x, y: worldPos.y, timer: 180, exploding: 0 });
-    state.bombCooldown = 120;
+    if (sessionActive()) sessionSend({ type: 'tool', action: 'bomb', target: worldPos });
   }
 
   function activateFreeze(target) {
-    if (state.freezeCooldown > 0) return;
-    const pcx = state.playerX + CHAR_W / 2;
-    const pcy = -state.playerY + CHAR_H / 2;
-    const dx = target.x - pcx, dy = target.y - pcy;
-    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-    state.iceShards.push({ x: pcx, y: pcy, vx: (dx / dist) * 5, vy: (dy / dist) * 5, life: 120 });
-    state.freezeCooldown = 600;
+    if (sessionActive()) sessionSend({ type: 'tool', action: 'freeze', target: target });
   }
 
   function fireLaser(target) {
-    if (state.laserCooldown > 0) return;
-    const pcx = state.playerX + CHAR_W / 2;
-    const pcy = -state.playerY + CHAR_H / 2;
-    const dx = target.x - pcx, dy = target.y - pcy;
-    const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-    state.laserBeams.push({ x: pcx, y: pcy, vx: (dx / dist) * 8, vy: (dy / dist) * 8, life: 60 });
-    state.laserCooldown = 45;
+    if (sessionActive()) sessionSend({ type: 'tool', action: 'laser', target: target });
   }
 
   // figure out which menu row was clicked
@@ -860,14 +1647,18 @@
     for (let i = layout.length - 1; i >= 0; i--) {
       const row = layout[i];
       const item = curItems[i];
-      const isCheat = item.startsWith('cheat_');
-      const rowHalf = isCheat ? 12 : 18;
+      const rowHalf = getMenuRowHeight(item) / 2;
       const visY = row.y - scrollY;
       if (visY + rowHalf < 4 || visY - rowHalf > H - 4) continue;
       if (sc.y > visY - rowHalf && sc.y < visY + rowHalf && sc.x > x0 && sc.x < x1) {
+        if (!isSelectableMenuItem(item)) return;
         const prevIdx = menu.selectedIndex;
         menu.selectedIndex = i;
         if (prevIdx !== i) triggerGlitch();
+        if (item === 'mode') {
+          setMenuMultiplayerMode(sc.x >= rowX + rowW / 2);
+          return;
+        }
         activateMenuItem(curItems[i]);
         return;
       }
@@ -878,8 +1669,37 @@
   const btnLeft = document.getElementById('btn-left');
   const btnRight = document.getElementById('btn-right');
   const btnJump = document.getElementById('btn-jump');
+  const btnPause = document.getElementById('btn-pause');
+  const btnSprint = document.getElementById('btn-sprint');
+  const btnCrouch = document.getElementById('btn-crouch');
+
+  let lastMobileLeftTap = 0;
+  let lastMobileRightTap = 0;
+  function triggerDash(_dirSign) {
+    if (!sessionActive()) return;
+    session.input.dash = true; sessionSendInput();
+    setTimeout(() => { session.input.dash = false; sessionSendInput(); }, 80);
+  }
+
+  function touchDirDoubleTap(isLeft) {
+    const now = Date.now();
+    if (isLeft) {
+      if (now - lastMobileLeftTap < DOUBLE_TAP_MS) {
+        triggerDash(-1);
+        lastMobileLeftTap = 0;
+      } else {
+        lastMobileLeftTap = now;
+      }
+    } else if (now - lastMobileRightTap < DOUBLE_TAP_MS) {
+      triggerDash(1);
+      lastMobileRightTap = 0;
+    } else {
+      lastMobileRightTap = now;
+    }
+  }
 
   function mobileBtn(btn, onDown, onUp) {
+    if (!btn) return;
     btn.addEventListener('touchstart', e => { e.preventDefault(); onDown(); }, { passive: false });
     btn.addEventListener('touchend', e => { e.preventDefault(); onUp(); }, { passive: false });
     btn.addEventListener('touchcancel', e => { e.preventDefault(); onUp(); }, { passive: false });
@@ -887,19 +1707,77 @@
     btn.addEventListener('mouseup', onUp);
     btn.addEventListener('mouseleave', onUp);
   }
-  mobileBtn(btnLeft, () => { if (state.phase === 'playing') state.movingLeft = true; }, () => { state.movingLeft = false; });
-  mobileBtn(btnRight, () => { if (state.phase === 'playing') state.movingRight = true; }, () => { state.movingRight = false; });
-  mobileBtn(btnJump, () => { tryJump(); }, () => {});
+
+  function mobileBtnPlaying(btn, onDown, onUp) {
+    if (!btn) return;
+    const down = () => {
+      if (state.phase === 'paused') { resumeFromPause(); return; }
+      onDown();
+    };
+    mobileBtn(btn, down, onUp);
+  }
+
+  function mobileTap(btn, handler) {
+    if (!btn) return;
+    const run = e => {
+      if (e.type === 'mousedown' && e.button !== 0) return;
+      e.preventDefault();
+      handler();
+    };
+    btn.addEventListener('touchstart', e => { e.preventDefault(); handler(); }, { passive: false });
+    btn.addEventListener('click', run);
+  }
+
+  mobileBtnPlaying(btnLeft, () => {
+    touchDirDoubleTap(true);
+    if (state.phase !== 'playing' || !sessionActive()) return;
+    session.input.left = true; sessionSendInput();
+  }, () => {
+    if (sessionActive()) { session.input.left = false; sessionSendInput(); }
+  });
+  mobileBtnPlaying(btnRight, () => {
+    touchDirDoubleTap(false);
+    if (state.phase !== 'playing' || !sessionActive()) return;
+    session.input.right = true; sessionSendInput();
+  }, () => {
+    if (sessionActive()) { session.input.right = false; sessionSendInput(); }
+  });
+  mobileBtnPlaying(btnJump, () => {
+    if (state.phase !== 'playing' || !sessionActive()) return;
+    state.mobileJumpHeld = true;
+    session.input.jump = true; sessionSendInput();
+  }, () => {
+    state.mobileJumpHeld = false;
+    if (sessionActive()) { session.input.jump = false; sessionSendInput(); }
+  });
+  mobileBtnPlaying(btnSprint, () => {
+    if (state.phase !== 'playing' || !sessionActive()) return;
+    state.mobileSprintHeld = true;
+    session.input.sprint = true; sessionSendInput();
+  }, () => {
+    state.mobileSprintHeld = false;
+    if (sessionActive()) { session.input.sprint = false; sessionSendInput(); }
+  });
+  mobileBtnPlaying(btnCrouch, () => {
+    if (state.phase !== 'playing' || !sessionActive()) return;
+    state.mobileCrouch = true;
+    session.input.crouch = true; sessionSendInput();
+  }, () => {
+    state.mobileCrouch = false;
+    if (sessionActive()) { session.input.crouch = false; sessionSendInput(); }
+  });
+  mobileTap(btnPause, () => {
+    if (state.phase === 'playing') pauseGameplay();
+    else if (state.phase === 'paused') resumeFromPause();
+  });
 
   // start / restart game
   function startGame() {
     menu.scoreSubmitted = false;
+    teardownSession();
     const s = freshState();
     s.phase = 'playing';
     s.gameStartTime = Date.now();
-    s.lastCoinSpawn = Date.now();
-    s.lastHeartSpawn = Date.now();
-    s.lastUpgradeSpawn = Date.now();
     const cheatedUpgrades = {};
     for (const k of ALL_CHEAT_KEYS) cheatedUpgrades[k] = menu.cheats[k];
     s.activeUpgrades = cheatedUpgrades;
@@ -910,188 +1788,59 @@
       }
     }
     state = s;
-  }
 
-  function tryJump() {
-    if (state.phase !== 'playing') return;
-    if (state.onGround || state.playerY >= -2) {
-      state.playerVY = JUMP_VEL; state.onGround = false; state.airJumpsUsed = 0; return;
-    }
-    if (state.activeUpgrades.wallClimb) {
-      const pL = state.playerX, pB = -state.playerY;
-      const rects = getCollisionRects();
-      let touchingWall = false;
-      for (const s of rects) {
-        if (overlap(pL - 2, pB, 2, CHAR_H, s.x, s.y, s.width, s.height) ||
-            overlap(pL + CHAR_W, pB, 2, CHAR_H, s.x, s.y, s.width, s.height)) {
-          touchingWall = true; break;
+    if (window.ShapescapeSession && window.ShapescapeSession.startSolo) {
+      const cheatsCopy = {};
+      for (const k of ALL_CHEAT_KEYS) cheatsCopy[k] = !!menu.cheats[k];
+      session.active = true;
+      session.kind = 'local';
+      const handle = window.ShapescapeSession.startSolo({
+        name: menu.playerName || 'ANON',
+        mode: 'coop',
+        cheats: cheatsCopy,
+        onState: snapshot => {
+          if (!session.localId && session.handle) session.localId = session.handle.getLocalId();
+          applyMultiplayerSnapshot(snapshot);
         }
-      }
-      if (touchingWall) { state.playerVY = JUMP_VEL * 0.85; return; }
-    }
-    if (state.activeUpgrades.doubleJump && state.airJumpsUsed < 1) {
-      state.playerVY = JUMP_VEL; state.airJumpsUsed++;
-    }
-  }
-
-  // collision helpers
-  function overlap(ax, ay, aw, ah, bx, by, bw, bh) {
-    return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
-  }
-
-  function resolveHorizontal(proposedX, bottom, squares, dir) {
-    if (dir === 0) return proposedX;
-    let x = proposedX;
-    for (const s of squares) {
-      if (!(bottom < s.y + s.height && bottom + CHAR_H > s.y)) continue;
-      if (dir > 0 && overlap(x, bottom, CHAR_W, CHAR_H, s.x, s.y, s.width, s.height))
-        x = Math.min(x, s.x - CHAR_W);
-      else if (dir < 0 && overlap(x, bottom, CHAR_W, CHAR_H, s.x, s.y, s.width, s.height))
-        x = Math.max(x, s.x + s.width);
-    }
-    return x;
-  }
-
-  function getCollisionRects() {
-    const rects = [];
-    for (const s of state.squares) {
-      if (s.segments) for (const seg of s.segments) rects.push(seg);
-      else rects.push(s);
-    }
-    return rects;
-  }
-
-  function generateLineSegments(x1, y1, x2, y2, thickness) {
-    const segs = [];
-    const dx = x2 - x1, dy = y2 - y1;
-    const len = Math.sqrt(dx * dx + dy * dy);
-    const steps = Math.max(1, Math.floor(len / 8));
-    for (let i = 0; i < steps; i++) {
-      const t1 = i / steps, t2 = (i + 1) / steps;
-      const sx = x1 + dx * t1, sy = y1 + dy * t1;
-      const ex = x1 + dx * t2, ey = y1 + dy * t2;
-      const mx = Math.min(sx, ex) - thickness / 2, my = Math.min(sy, ey) - thickness / 2;
-      segs.push({ x: mx, y: my, width: Math.abs(ex - sx) + thickness, height: Math.abs(ey - sy) + thickness });
-    }
-    return segs;
-  }
-
-  function generateBezierSegments(p0, p1, p2, thickness) {
-    const segs = [];
-    const steps = 16;
-    for (let i = 0; i < steps; i++) {
-      const t1 = i / steps, t2 = (i + 1) / steps;
-      const bx1 = (1 - t1) * (1 - t1) * p0.x + 2 * (1 - t1) * t1 * p1.x + t1 * t1 * p2.x;
-      const by1 = (1 - t1) * (1 - t1) * p0.y + 2 * (1 - t1) * t1 * p1.y + t1 * t1 * p2.y;
-      const bx2 = (1 - t2) * (1 - t2) * p0.x + 2 * (1 - t2) * t2 * p1.x + t2 * t2 * p2.x;
-      const by2 = (1 - t2) * (1 - t2) * p0.y + 2 * (1 - t2) * t2 * p1.y + t2 * t2 * p2.y;
-      const mx = Math.min(bx1, bx2) - thickness / 2, my = Math.min(by1, by2) - thickness / 2;
-      segs.push({ x: mx, y: my, width: Math.abs(bx2 - bx1) + thickness, height: Math.abs(by2 - by1) + thickness });
-    }
-    return segs;
-  }
-
-  function generateCircleSegments(cx, cy, r) {
-    const segs = [];
-    const steps = Math.max(6, Math.ceil(r / 3));
-    for (let i = 0; i < steps; i++) {
-      const y0 = cy - r + (2 * r * i / steps);
-      const y1 = cy - r + (2 * r * (i + 1) / steps);
-      const midY = (y0 + y1) / 2;
-      const dy = midY - cy;
-      const halfW = Math.sqrt(Math.max(0, r * r - dy * dy));
-      if (halfW > 0.5) {
-        segs.push({ x: cx - halfW, y: y0, width: halfW * 2, height: y1 - y0 });
-      }
-    }
-    return segs;
-  }
-
-  function generateTriangleSegments(v1, v2, v3) {
-    const segs = [];
-    const minY = Math.min(v1.y, v2.y, v3.y);
-    const maxY = Math.max(v1.y, v2.y, v3.y);
-    const height = maxY - minY;
-    if (height < 1) return segs;
-    const steps = Math.max(6, Math.ceil(height / 3));
-    const edges = [[v1, v2], [v2, v3], [v3, v1]];
-    for (let i = 0; i < steps; i++) {
-      const y0 = minY + (height * i / steps);
-      const y1 = minY + (height * (i + 1) / steps);
-      const midY = (y0 + y1) / 2;
-      const xs = [];
-      for (const [a, b] of edges) {
-        if ((a.y <= midY && b.y > midY) || (b.y <= midY && a.y > midY)) {
-          const t = (midY - a.y) / (b.y - a.y);
-          xs.push(a.x + t * (b.x - a.x));
-        }
-      }
-      if (xs.length >= 2) {
-        const xMin = Math.min.apply(null, xs);
-        const xMax = Math.max.apply(null, xs);
-        if (xMax - xMin > 0.5) {
-          segs.push({ x: xMin, y: y0, width: xMax - xMin, height: y1 - y0 });
-        }
-      }
-    }
-    return segs;
-  }
-
-  function generatePolygonSegments(vertices) {
-    const segs = [];
-    let minY = Infinity, maxY = -Infinity;
-    for (const v of vertices) {
-      if (v.y < minY) minY = v.y;
-      if (v.y > maxY) maxY = v.y;
-    }
-    const height = maxY - minY;
-    if (height < 1) return segs;
-    const steps = Math.max(6, Math.ceil(height / 3));
-    for (let i = 0; i < steps; i++) {
-      const y0 = minY + (height * i / steps);
-      const y1 = minY + (height * (i + 1) / steps);
-      const midY = (y0 + y1) / 2;
-      const xs = [];
-      for (let j = 0; j < vertices.length; j++) {
-        const a = vertices[j];
-        const b = vertices[(j + 1) % vertices.length];
-        if ((a.y <= midY && b.y > midY) || (b.y <= midY && a.y > midY)) {
-          const t = (midY - a.y) / (b.y - a.y);
-          xs.push(a.x + t * (b.x - a.x));
-        }
-      }
-      xs.sort(function (a, b) { return a - b; });
-      for (let j = 0; j + 1 < xs.length; j += 2) {
-        if (xs[j + 1] - xs[j] > 0.5) {
-          segs.push({ x: xs[j], y: y0, width: xs[j + 1] - xs[j], height: y1 - y0 });
-        }
-      }
-    }
-    return segs;
-  }
-
-  function spawnHitParticles(x, y, color) {
-    const count = 5 + Math.floor(Math.random() * 4);
-    for (let i = 0; i < count; i++) {
-      const angle = Math.random() * Math.PI * 2;
-      const speed = 0.5 + Math.random() * 1.5;
-      state.particles.push({
-        x: x, y: y,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
-        life: 12 + Math.floor(Math.random() * 8),
-        maxLife: 12 + Math.floor(Math.random() * 8),
-        size: 1 + Math.floor(Math.random() * 3),
-        color: color,
       });
+      session.handle = handle;
+      session.localId = handle.getLocalId();
     }
   }
 
-  function applyDamage(amount) {
-    if (state.activeUpgrades.armor) amount = Math.ceil(amount * 0.6);
-    state.health = Math.max(0, state.health - amount);
-    state.damageFlash = 12;
-    if (state.health <= 0) { state.phase = 'gameover'; onGameOver(); }
+  function playerHitH() {
+    return state.crouching ? CHAR_H_CROUCH : CHAR_H;
+  }
+
+  /** Feet stay at world `y`; corpse is scaled to CHAR_H tall, centered on the 32px player slot. */
+  function drawPlayerCorpseSprite(x, y, direction, cam, fillFallback, damageFlash) {
+    const img = assets.dead;
+    const dh = CHAR_H;
+    const dw =
+      img && img.naturalWidth && img.naturalHeight
+        ? Math.max(1, Math.round(img.naturalWidth * (dh / img.naturalHeight)))
+        : CHAR_W;
+    const px = x + (CHAR_W - dw) / 2 - cam;
+    const py = H - y - dh;
+    ctx.save();
+    ctx.imageSmoothingEnabled = false;
+    if ((direction || 'right') === 'left') {
+      ctx.translate(px + dw, py);
+      ctx.scale(-1, 1);
+    } else ctx.translate(px, py);
+    if (img && img.complete) ctx.drawImage(img, 0, 0, dw, dh);
+    else {
+      ctx.fillStyle = fillFallback;
+      ctx.fillRect(0, 0, dw, dh);
+    }
+    if (damageFlash > 0) {
+      ctx.globalCompositeOperation = 'source-atop';
+      ctx.fillStyle = `rgba(255,51,51,${Math.min(0.6, (damageFlash || 0) / 12 * 0.6)})`;
+      ctx.fillRect(0, 0, dw, dh);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+    ctx.imageSmoothingEnabled = true;
+    ctx.restore();
   }
 
   function hasCheatsEnabled() {
@@ -1101,528 +1850,359 @@
   function onGameOver() {
     if (menu.scoreSubmitted) return;
     menu.scoreSubmitted = true;
+    // Leaderboard gate: only skip when cheats were enabled during the run. Both solo
+    // (LocalSession) and multiplayer (NetworkSession) runs submit through the same path.
     if (hasCheatsEnabled()) return;
     const name = menu.playerName || 'ANON';
     const survivedSec = Math.floor((Date.now() - state.gameStartTime) / 1000);
     submitScore(name, state.score, survivedSec);
   }
 
-  function ejectPlayerFromShape(shape) {
-    const pL = state.playerX, pB = -state.playerY;
-    if (!overlap(pL, pB, CHAR_W, CHAR_H, shape.x, shape.y, shape.width, shape.height)) return;
-
-    const oldX = state.playerX, oldY = state.playerY;
-
-    const toLeft = (pL + CHAR_W) - shape.x;
-    const toRight = (shape.x + shape.width) - pL;
-    const toBottom = (pB + CHAR_H) - shape.y;
-    const toTop = (shape.y + shape.height) - pB;
-    const min = Math.min(toLeft, toRight, toBottom, toTop);
-
-    if (min === toTop) {
-      state.playerY = -(shape.y + shape.height);
-      state.playerVY = 0;
-      state.onGround = true;
-    } else if (min === toBottom) {
-      state.playerY = -(shape.y - CHAR_H);
-      state.playerVY = 0;
-    } else if (min === toLeft) {
-      state.playerX = shape.x - CHAR_W;
-    } else {
-      state.playerX = shape.x + shape.width;
-    }
-
-    const dx = state.playerX - oldX;
-    const dy = state.playerY - oldY;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist >= 30) {
-      const pct = Math.min(dist / 200, 0.5);
-      const dmg = Math.max(1, Math.floor(state.health * pct));
-      applyDamage(dmg);
-    }
-  }
-
-  function resolveVertical(proposedY, px, squares, vy) {
-    let y = proposedY, vel = vy, grounded = false;
-    const pL = px, pR = px + CHAR_W;
-    let bottom = -y;
-    if (vel > 0 && bottom <= 0) { y = 0; vel = 0; grounded = true; }
-    bottom = -y;
-    if (vel >= 0) {
-      let highest = null;
-      for (const s of squares) {
-        if (!(pL < s.x + s.width && pR > s.x)) continue;
-        if (!overlap(pL, bottom, CHAR_W, CHAR_H, s.x, s.y, s.width, s.height)) continue;
-        const top = s.y + s.height;
-        if (highest === null || top > highest) highest = top;
-      }
-      if (highest !== null) { y = -highest; vel = 0; grounded = true; }
-    } else {
-      let lowest = null;
-      for (const s of squares) {
-        if (!(pL < s.x + s.width && pR > s.x)) continue;
-        if (!overlap(pL, bottom, CHAR_W, CHAR_H, s.x, s.y, s.width, s.height)) continue;
-        if (lowest === null || s.y < lowest) lowest = s.y;
-      }
-      if (lowest !== null) { y = -(lowest - CHAR_H); vel = 0; }
-    }
-    return { y, vy: vel, onGround: grounded };
-  }
-
-  // update — runs every frame
-  function update() {
-    if (state.phase !== 'playing' || state.health <= 0) return;
-    const now = Date.now();
-
-    let dir = 0;
-    if (state.movingLeft) dir = -1;
-    else if (state.movingRight) dir = 1;
-    if (dir === -1) state.direction = 'left';
-    else if (dir === 1) state.direction = 'right';
-    if (dir !== 0) state.idleImg = idleImages[Math.floor(Math.random() * 3)];
-
-    let speed = (state.sprinting && state.activeUpgrades.sprint) ? SPRINT_SPEED : MOVE_SPEED;
-    if (state.dashActive > 0) { speed = 8; state.dashActive--; }
-    if (state.dashCooldown > 0) state.dashCooldown--;
-    if (state.damageFlash > 0) state.damageFlash--;
-
-    // grapple pull — override normal gravity while hooked
-    let grappleHX = 0;
-    let grappling = !!state.grapple;
-    if (grappling) {
-      const g = state.grapple;
-      const gdx = g.tx - (state.playerX + CHAR_W / 2);
-      const gdy = g.ty - (-state.playerY + CHAR_H / 2);
-      const gdist = Math.sqrt(gdx * gdx + gdy * gdy);
-      if (gdist > 12) {
-        const pullSpeed = Math.min(4.5, 1.5 + gdist * 0.01);
-        grappleHX = (gdx / gdist) * pullSpeed;
-        state.playerVY = state.playerVY * 0.3 + (-(gdy / gdist) * pullSpeed) * 0.7;
-      }
-    }
-
-    const colRects = getCollisionRects();
-    const proposedX = state.playerX + dir * speed + grappleHX + state.portalBoostVX;
-    state.portalBoostVX *= 0.92;
-    if (Math.abs(state.portalBoostVX) < 0.05) state.portalBoostVX = 0;
-    const hDir = proposedX > state.playerX ? 1 : proposedX < state.playerX ? -1 : dir;
-    const resolvedX = resolveHorizontal(proposedX, -state.playerY, colRects, hDir);
-
-    if (grappling && grappleHX !== 0 && Math.abs(resolvedX - proposedX) > 0.5) {
-      state.grapple = null;
-      state.grappleCooldown = 90;
-      grappling = false;
-    }
-    state.playerX = resolvedX;
-
-    if (!grappling) state.playerVY += GRAVITY;
-    if (state.activeUpgrades.glide && !state.onGround && state.playerVY > 0 && (keys['Space'] || keys['ArrowUp'] || keys['KeyW'])) {
-      state.playerVY = Math.min(state.playerVY, 1.0);
-    }
-    const vr = resolveVertical(state.playerY + state.playerVY, state.playerX, colRects, state.playerVY);
-    state.playerY = vr.y; state.playerVY = vr.vy;
-    if (vr.onGround) { state.onGround = true; state.airJumpsUsed = 0; } else state.onGround = false;
-
-    if (grappling && vr.onGround) {
-      state.grapple = null;
-      state.grappleCooldown = 90;
-    }
-
-    const deadLeft = W * 0.3;
-    const deadRight = W * 0.65;
-    const screenX = state.playerX - state.cameraX;
-    let targetCam = state.cameraX;
-    if (screenX < deadLeft) targetCam = state.playerX - deadLeft;
-    else if (screenX > deadRight) targetCam = state.playerX - deadRight;
-    targetCam = Math.max(0, targetCam);
-    state.cameraX += (targetCam - state.cameraX) * 0.08;
-
-    // portal teleport — rectangular hitbox, momentum preserved
-    const PORTAL_HIT_W = 14, PORTAL_HIT_H = 48;
-    if (state.portals.length === 2 && state.portalCooldown <= 0) {
-      const pL2 = state.playerX, pB2 = -state.playerY;
-      for (let i = 0; i < 2; i++) {
-        const pt = state.portals[i], other = state.portals[1 - i];
-        if (overlap(pL2, pB2, CHAR_W, CHAR_H,
-                    pt.x - PORTAL_HIT_W / 2, pt.y - PORTAL_HIT_H / 2,
-                    PORTAL_HIT_W, PORTAL_HIT_H)) {
-          const entryVX = dir * speed + state.portalBoostVX;
-          state.playerX = other.x - CHAR_W / 2;
-          state.playerY = -(other.y - CHAR_H / 2);
-          state.portalBoostVX = entryVX * 1.15;
-          spawnHitParticles(pt.x, pt.y, i === 0 ? '#3399ff' : '#ff8c1a');
-          spawnHitParticles(other.x, other.y, (1 - i) === 0 ? '#3399ff' : '#ff8c1a');
-          state.portalCooldown = 20;
-          break;
-        }
-      }
-    }
-    if (state.portalCooldown > 0) state.portalCooldown--;
-
-    // sword swing — advance frame, check hits at frame 3
-    if (state.swordSwing) {
-      state.swordSwing.frame++;
-      if (state.swordSwing.frame === 3 && !state.swordSwing.hit) {
-        state.swordSwing.hit = true;
-        const pcx = state.playerX + CHAR_W / 2, pcy = -state.playerY + CHAR_H / 2;
-        // check fish
-        if (state.fish.spawned) {
-          const fdx = state.fish.x - pcx, fdy = state.fish.y - pcy;
-          const fdist = Math.sqrt(fdx * fdx + fdy * fdy);
-          if (fdist < 60) {
-            state.fishHP -= 25;
-            if (fdist > 1) { state.fish.x += (fdx / fdist) * 50; state.fish.y += (fdy / fdist) * 50; }
-          }
-        }
-        // check bugs
-        if (window.BugSystem) {
-          const bugKills = window.BugSystem.swordHitBugs(state.bugs, pcx, pcy, 60);
-          state.score += bugKills * 10;
-        }
-        // check danglies
-        if (window.DanglySystem) {
-          const danglyKills = window.DanglySystem.swordHitDanglies(state.danglies, pcx, pcy, 60);
-          state.score += danglyKills * 15;
-        }
-        // deflect nearby projectiles
-        state.projectiles = state.projectiles.filter(p => {
-          const pdx = p.x - pcx, pdy = p.y - pcy;
-          return Math.sqrt(pdx * pdx + pdy * pdy) > 50;
-        });
-      }
-      if (state.swordSwing.frame > 12) state.swordSwing = null;
-    }
-    if (state.swordCooldown > 0) state.swordCooldown--;
-
-    // spawn coins ahead of the player
-    const isMoving = dir !== 0;
-    if (isMoving && now - state.lastCoinSpawn > 8000 + Math.random() * 7000) {
-      state.coins.push({
-        id: 'c' + now + Math.random(),
-        x: state.playerX + 300 + Math.random() * 200,
-        y: Math.random() * (H * 0.6),
-        type: Math.floor(Math.random() * 4) + 1
-      });
-      state.lastCoinSpawn = now;
-    }
-
-    // spawn a heart pickup if player is damaged
-    if (isMoving && state.health < 100 && now - state.lastHeartSpawn > 20000 + Math.random() * 15000) {
-      state.hearts.push({
-        id: 'h' + now + Math.random(),
-        x: state.playerX + 250 + Math.random() * 300,
-        y: 10 + Math.random() * (H * 0.5),
-        heal: 20 + Math.floor(Math.random() * 3) * 5,
-      });
-      state.lastHeartSpawn = now;
-    }
-
-    // spawn upgrade pickups — rarer than coins
-    if (isMoving && now - state.lastUpgradeSpawn > 30000 + Math.random() * 25000) {
-      const available = Object.keys(UPGRADE_DEFS).filter(k => !state.activeUpgrades[k]);
-      if (available.length > 0) {
-        const key = available[Math.floor(Math.random() * available.length)];
-        state.upgrades.push({
-          id: 'u' + now + Math.random(),
-          x: state.playerX + 400 + Math.random() * 300,
-          y: 10 + Math.random() * (H * 0.4),
-          key
-        });
-      }
-      state.lastUpgradeSpawn = now;
-    }
-
-    // collect coins / hearts / upgrades on overlap
-    const pL = state.playerX, pB = -state.playerY;
-    state.coins = state.coins.filter(c => {
-      if (overlap(pL, pB, CHAR_W, CHAR_H, c.x - 8, c.y - 8, 16, 16)) { state.score += COIN_VALUES[c.type] || 1; return false; }
-      return true;
-    });
-    state.hearts = state.hearts.filter(h => {
-      if (overlap(pL, pB, CHAR_W, CHAR_H, h.x - 8, h.y - 8, 16, 16)) {
-        state.health = Math.min(100, state.health + h.heal);
-        return false;
-      }
-      return true;
-    });
-    state.upgrades = state.upgrades.filter(u => {
-      if (overlap(pL, pB, CHAR_W, CHAR_H, u.x - 8, u.y - 8, 16, 16)) {
-        const def = UPGRADE_DEFS[u.key];
-        if (state.score >= def.cost) {
-          state.score -= def.cost;
-          state.activeUpgrades[u.key] = true;
-          if (def.tool && state.inventory.indexOf(def.tool) === -1) {
-            state.inventory.push(def.tool);
-          }
-          return false;
-        }
-      }
-      return true;
-    });
-
-    // coin magnet upgrade — pull nearby coins toward player
-    if (state.activeUpgrades.coinMagnet) {
-      const magnetRange = 120;
-      const mcx = state.playerX + CHAR_W / 2, mcy = -state.playerY + CHAR_H / 2;
-      for (const c of state.coins) {
-        const mdx = mcx - c.x, mdy = mcy - c.y;
-        const mdist = Math.sqrt(mdx * mdx + mdy * mdy);
-        if (mdist < magnetRange && mdist > 1) { c.x += (mdx / mdist) * 1.5; c.y += (mdy / mdist) * 1.5; }
-      }
-    }
-
-    // regen upgrade — slow health recovery
-    if (state.activeUpgrades.regen && state.health > 0 && state.health < 100) {
-      state.regenTick++;
-      if (state.regenTick >= 180) { state.health = Math.min(100, state.health + 1); state.regenTick = 0; }
-    }
-
-    // release grapple once we get close enough to the target
-    if (state.grapple) {
-      const g = state.grapple;
-      const gdx = g.tx - (state.playerX + CHAR_W / 2);
-      const gdy = g.ty - (-state.playerY + CHAR_H / 2);
-      if (Math.sqrt(gdx * gdx + gdy * gdy) <= 12) {
-        state.playerVY = Math.min(state.playerVY, -2);
-        state.grapple = null;
-        state.grappleCooldown = 90;
-      }
-    }
-    if (state.grappleCooldown > 0) state.grappleCooldown--;
-
-    // bombs — countdown, explode, then remove
-    state.bombs = state.bombs.filter(b => {
-      b.timer--;
-      if (b.timer <= 0 && b.exploding === 0) {
-        b.exploding = 15;
-        if (state.fish.spawned) {
-          const bdx = state.fish.x - b.x, bdy = state.fish.y - b.y;
-          if (Math.sqrt(bdx * bdx + bdy * bdy) < 80) state.fishHP -= 40;
-        }
-        state.projectiles = state.projectiles.filter(p => {
-          const bdx2 = p.x - b.x, bdy2 = p.y - b.y;
-          return Math.sqrt(bdx2 * bdx2 + bdy2 * bdy2) > 80;
-        });
-      }
-      if (b.exploding > 0) { b.exploding--; return b.exploding > 0; }
-      return b.timer > 0;
-    });
-    if (state.bombCooldown > 0) state.bombCooldown--;
-    if (state.reflectorCooldown > 0) state.reflectorCooldown--;
-
-    if (state.fishShootPulse > 0) state.fishShootPulse--;
-    if (state.fishFrozen > 0) state.fishFrozen--;
-    if (state.freezeCooldown > 0) state.freezeCooldown--;
-    if (state.laserCooldown > 0) state.laserCooldown--;
-
-    // ice shards — travel toward cursor, freeze only the enemy hit
-    state.iceShards = state.iceShards.filter(s => {
-      s.x += s.vx; s.y += s.vy; s.life--;
-      if (s.life <= 0) return false;
-      if (state.fish.spawned) {
-        const dx = s.x - state.fish.x, dy = s.y - state.fish.y;
-        if (Math.sqrt(dx * dx + dy * dy) < 30) {
-          state.fishFrozen = 240;
-          spawnHitParticles(s.x, s.y, COL.cyan);
-          return false;
-        }
-      }
-      for (const b of state.bugs) {
-        const dx = s.x - b.x, dy = s.y - b.y;
-        if (Math.sqrt(dx * dx + dy * dy) < 20) {
-          b.frozen = 240;
-          spawnHitParticles(s.x, s.y, COL.cyan);
-          return false;
-        }
-      }
-      for (const d of state.danglies) {
-        const dx = s.x - (d.x + 9), dy = s.y - (d.y + 17);
-        if (Math.sqrt(dx * dx + dy * dy) < 24) {
-          d.frozen = 240;
-          spawnHitParticles(s.x, s.y, COL.cyan);
-          return false;
-        }
-      }
-      return true;
-    });
-
-    // laser beams — travel fast, deal damage on contact
-    state.laserBeams = state.laserBeams.filter(l => {
-      l.x += l.vx; l.y += l.vy; l.life--;
-      if (l.life <= 0) return false;
-      if (state.fish.spawned) {
-        const dx = l.x - state.fish.x, dy = l.y - state.fish.y;
-        if (Math.sqrt(dx * dx + dy * dy) < 25) {
-          state.fishHP -= 18;
-          spawnHitParticles(l.x, l.y, COL.red);
-          return false;
-        }
-      }
-      for (const b of state.bugs) {
-        const dx = l.x - (b.x + 7), dy = l.y - (b.y + 6);
-        if (Math.sqrt(dx * dx + dy * dy) < 20) {
-          b.hp -= 12;
-          b.hurtTimer = 10;
-          spawnHitParticles(l.x, l.y, COL.red);
-          return false;
-        }
-      }
-      for (const d of state.danglies) {
-        const dx = l.x - (d.x + 9), dy = l.y - (d.y + 17);
-        if (Math.sqrt(dx * dx + dy * dy) < 24) {
-          d.hp -= 15;
-          d.hurtTimer = 10;
-          spawnHitParticles(l.x, l.y, COL.red);
-          return false;
-        }
-      }
-      return true;
-    });
-
-    // fish boss AI — spawns, chases, shoots, respawns harder each time
-    const elapsed = now - state.gameStartTime;
-    const fish = state.fish;
-
-    if (state.fishHP <= 0 && fish.spawned) {
-      fish.spawned = false;
-      state.score += 50;
-      state.projectiles = [];
-      state.fishRespawnTime = now + 90000;
-      state.fishMaxHP = Math.floor(state.fishMaxHP * 1.3);
-    }
-    if (!fish.spawned && state.fishRespawnTime > 0 && now >= state.fishRespawnTime && Math.random() < 0.002) {
-      fish.spawned = true;
-      fish.x = state.playerX + 400;
-      fish.y = H * 0.5;
-      fish.speed = 0.4;
-      fish.lastShot = now;
-      state.fishHP = state.fishMaxHP;
-      state.fishRespawnTime = 0;
-    }
-
-    if (!fish.spawned && elapsed >= FISH_SPAWN_DELAY && state.fishRespawnTime === 0 && Math.random() < 0.002) {
-      fish.spawned = true; fish.x = state.playerX + 400; fish.y = H * 0.5; fish.speed = 0.4; fish.lastShot = now;
-      state.fishHP = state.fishMaxHP;
-    }
-    if (fish.spawned && state.fishFrozen <= 0) {
-      fish.speed = Math.min(0.4 + ((elapsed - FISH_SPAWN_DELAY) / 1000) * 0.012, 1.8);
-      const pcx = state.playerX + CHAR_W / 2, pcy = -state.playerY + CHAR_H / 2;
-      const dx = pcx - fish.x, dy = pcy - fish.y, dist = Math.sqrt(dx * dx + dy * dy);
-      let eff = fish.speed;
-      if (dist > 300) eff = fish.speed * (1 + (dist - 300) / 200);
-      if (dist > 1) { fish.x += (dx / dist) * eff; fish.y += (dy / dist) * eff; }
-      fish.rotation = Math.atan2(dy, dx);
-      if (now - fish.lastShot > 2500 + Math.random() * 100 && dist > 60) {
-        const roll = Math.random();
-        let type = roll > 0.92 ? 'blue' : roll > 0.82 ? 'yellow' : 'red';
-        state.projectiles.push({ id: 'fp' + now + Math.random(), x: fish.x, y: fish.y, vx: (dx / dist) * 2.5, vy: (dy / dist) * 2.5, type });
-        fish.lastShot = now;
-        state.fishShootPulse = 18;
-      }
-      if (fish.touchCd > 0) fish.touchCd--;
-      if (fish.touchCd <= 0 && overlap(pL, pB, CHAR_W, CHAR_H, fish.x - 18, fish.y - 18, 36, 36)) {
-        applyDamage(15);
-        fish.touchCd = 60;
-      }
-    }
-
-    // reflector — flip projectile velocity on contact
-    for (const ref of state.reflectors) {
-      for (const p of state.projectiles) {
-        if (p.reflected) continue;
-        const rdx = p.x - ref.x, rdy = p.y - ref.y;
-        if (Math.sqrt(rdx * rdx + rdy * rdy) < 16) {
-          p.vx = -p.vx; p.vy = -p.vy;
-          p.reflected = true;
-        }
-      }
-    }
-
-    const colRectsProj = getCollisionRects();
-    const projColors = { red: COL.red, blue: '#4488ee', yellow: COL.amber };
-    state.projectiles = state.projectiles.filter(p => {
-      p.x += p.vx; p.y += p.vy;
-      if ((p.x - state.playerX) ** 2 + (p.y + state.playerY) ** 2 > 640000) return false;
-      if (p.y <= 0) { spawnHitParticles(p.x, 0, projColors[p.type]); return false; }
-      if (p.reflected && state.fish.spawned) {
-        const rdx = p.x - state.fish.x, rdy = p.y - state.fish.y;
-        if (Math.sqrt(rdx * rdx + rdy * rdy) < 20) { state.fishHP -= 15; spawnHitParticles(p.x, p.y, projColors[p.type]); return false; }
-      }
-      const ps = 6, plx = p.x - ps / 2, pby = p.y - ps / 2;
-      if (p.type === 'red' || p.reflected) {
-        for (const s of colRectsProj) {
-          if (overlap(plx, pby, ps, ps, s.x, s.y, s.width, s.height)) { spawnHitParticles(p.x, p.y, projColors[p.type]); return false; }
-        }
-      }
-      if (p.type === 'yellow' && !state.activeUpgrades.reinforce && !p.reflected) {
-        const before = state.squares.length;
-        state.squares = state.squares.filter(s => !overlap(plx, pby, ps, ps, s.x, s.y, s.width, s.height));
-        if (state.squares.length < before) spawnHitParticles(p.x, p.y, projColors[p.type]);
-        if (state.grapple && state.squares.length < before && state.squares.indexOf(state.grapple.shape) === -1) {
-          state.grapple = null;
-          state.grappleCooldown = 90;
-        }
-      }
-      if (!p.reflected && overlap(pL, pB, CHAR_W, CHAR_H, plx, pby, ps, ps)) {
-        applyDamage(p.type === 'red' ? 12 : 6);
-        spawnHitParticles(p.x, p.y, projColors[p.type]);
-        return false;
-      }
-      return true;
-    });
-
-    // update hit particles
-    state.particles = state.particles.filter(pt => {
-      pt.x += pt.vx;
-      pt.y += pt.vy;
-      pt.vx *= 0.92;
-      pt.vy *= 0.92;
-      pt.life--;
-      return pt.life > 0;
-    });
-
-    // bug enemies — tick per-bug frozen timers, skip frozen bugs in update
-    if (window.BugSystem) {
-      const BS = window.BugSystem;
-      if (elapsed > 4000) {
-        state.lastBugSpawn = BS.maybeSpawn(state.bugs, state.playerX, state.lastBugSpawn, now);
-      }
-      state.bugs = state.bugs.filter(b => b.hp > 0);
-      const unfrozenBugs = [];
-      for (const b of state.bugs) {
-        if (b.frozen > 0) { b.frozen--; } else { unfrozenBugs.push(b); }
-      }
-      if (unfrozenBugs.length > 0) {
-        BS.updateAll(unfrozenBugs, state.playerX, pB, state.squares, H, frameTick);
-      }
-      const bugDmg = BS.checkPlayerCollision(state.bugs, pL, pB, CHAR_W, CHAR_H);
-      if (bugDmg > 0) { applyDamage(bugDmg); }
-    }
-
-    // dangly enemies — tick per-dangly frozen timers, skip frozen danglies
-    if (window.DanglySystem) {
-      const DS = window.DanglySystem;
-      if (elapsed > 8000) {
-        state.lastDanglySpawn = DS.maybeSpawn(state.danglies, state.playerX, state.lastDanglySpawn, now);
-      }
-      state.danglies = state.danglies.filter(d => d.hp > 0);
-      const unfrozenDanglies = [];
-      for (const d of state.danglies) {
-        if (d.frozen > 0) { d.frozen--; } else { unfrozenDanglies.push(d); }
-      }
-      if (unfrozenDanglies.length > 0) {
-        DS.updateAll(unfrozenDanglies, state.playerX, pB, state.squares, H, frameTick);
-      }
-      const danglyDmg = DS.checkPlayerCollision(state.danglies, pL, pB, CHAR_W, CHAR_H);
-      if (danglyDmg > 0) { applyDamage(danglyDmg); }
-    }
-  }
-
   // render — called every frame after update
   let walkFrame = 0, walkTimer = 0;
+  let crouchWalkFrame = 0, crouchWalkTimer = 0;
+
+  // Render another player's in-progress shape draft (dragging, polygon points
+  // so far, bezier control points). Mirrors the local preview geometry but uses
+  // a marching-ant dash so it reads as "live", plus a small name tag anchored
+  // to the draft's top-left so you can tell who is drawing what.
+  function drawRemoteDraft(draft, cam, name) {
+    if (!draft || !draft.tool) return;
+    const tool = draft.tool;
+    ctx.save();
+    ctx.setLineDash([5, 5]);
+    // Marching-ant offset — tied to frameTick so every remote draft shares the
+    // same animation phase on this client.
+    ctx.lineDashOffset = -(frameTick * 0.5) % 10;
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = COL.amber;
+    ctx.globalAlpha = 0.75;
+
+    let anchorX = null;
+    let anchorY = null;
+
+    if ((tool === 'square' || tool === 'circle' || tool === 'triangle' || tool === 'line')
+        && draft.start && draft.end) {
+      const s = draft.start, e = draft.end;
+      const dw = Math.abs(e.x - s.x), dh = Math.abs(e.y - s.y);
+      if (tool === 'circle') {
+        const ccx = (s.x + e.x) / 2 - cam;
+        const ccy = H - (s.y + e.y) / 2;
+        const r = Math.min(dw, dh) / 2;
+        ctx.beginPath(); ctx.arc(ccx, ccy, r, 0, Math.PI * 2); ctx.stroke();
+        anchorX = ccx - r; anchorY = ccy - r;
+      } else if (tool === 'triangle') {
+        const tsx = Math.min(s.x, e.x), tsy = Math.min(s.y, e.y);
+        ctx.beginPath();
+        ctx.moveTo(tsx + dw / 2 - cam, H - (tsy + dh));
+        ctx.lineTo(tsx - cam, H - tsy);
+        ctx.lineTo(tsx + dw - cam, H - tsy);
+        ctx.closePath(); ctx.stroke();
+        anchorX = tsx - cam; anchorY = H - (tsy + dh);
+      } else if (tool === 'line') {
+        ctx.beginPath();
+        ctx.moveTo(s.x - cam, H - s.y);
+        ctx.lineTo(e.x - cam, H - e.y);
+        ctx.stroke();
+        anchorX = Math.min(s.x, e.x) - cam;
+        anchorY = Math.min(H - s.y, H - e.y);
+      } else {
+        const sx = Math.min(s.x, e.x) - cam;
+        const sy = H - Math.max(s.y, e.y);
+        ctx.strokeRect(sx, sy, dw, dh);
+        anchorX = sx; anchorY = sy;
+      }
+    } else if (tool === 'polygon' && draft.points && draft.points.length > 0) {
+      const pts = draft.points;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x - cam, H - pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x - cam, H - pts[i].y);
+      if (draft.cursor) ctx.lineTo(draft.cursor.x - cam, H - draft.cursor.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      for (const p of pts) {
+        ctx.fillStyle = COL.amber;
+        ctx.beginPath(); ctx.arc(p.x - cam, H - p.y, 2, 0, Math.PI * 2); ctx.fill();
+      }
+      let minX = pts[0].x, maxY = pts[0].y;
+      for (const p of pts) { if (p.x < minX) minX = p.x; if (p.y > maxY) maxY = p.y; }
+      anchorX = minX - cam; anchorY = H - maxY;
+    } else if (tool === 'bezier' && draft.points && draft.points.length > 0) {
+      const bp = draft.points;
+      if (bp.length === 1 && draft.cursor) {
+        ctx.beginPath();
+        ctx.moveTo(bp[0].x - cam, H - bp[0].y);
+        ctx.lineTo(draft.cursor.x - cam, H - draft.cursor.y);
+        ctx.stroke();
+      } else if (bp.length === 2 && draft.cursor) {
+        ctx.beginPath();
+        ctx.moveTo(bp[0].x - cam, H - bp[0].y);
+        ctx.quadraticCurveTo(draft.cursor.x - cam, H - draft.cursor.y, bp[1].x - cam, H - bp[1].y);
+        ctx.stroke();
+      } else if (bp.length >= 2) {
+        ctx.beginPath();
+        ctx.moveTo(bp[0].x - cam, H - bp[0].y);
+        ctx.lineTo(bp[1].x - cam, H - bp[1].y);
+        ctx.stroke();
+      }
+      ctx.setLineDash([]);
+      for (const p of bp) {
+        ctx.fillStyle = COL.amber;
+        ctx.beginPath(); ctx.arc(p.x - cam, H - p.y, 2, 0, Math.PI * 2); ctx.fill();
+      }
+      anchorX = bp[0].x - cam; anchorY = H - bp[0].y;
+    }
+
+    ctx.setLineDash([]);
+    ctx.restore();
+
+    if (name && anchorX !== null && anchorY !== null) {
+      ctx.save();
+      ctx.globalAlpha = 0.85;
+      ctx.fillStyle = COL.amber;
+      ctx.font = '8px ' + FONT_MONO;
+      ctx.textAlign = 'left';
+      ctx.fillText(name.toUpperCase(), Math.round(anchorX), Math.round(anchorY) - 4);
+      ctx.restore();
+    }
+  }
+
+  // Stable, distinct per-player (owner) portal color pair. A/B hues are 180°
+  // apart so they're always visually distinguishable; different owners also
+  // get different base hues via a cheap string hash so two players' portals
+  // don't collide visually.
+  function hashString(str) {
+    let h = 2166136261 >>> 0;
+    for (let i = 0; i < (str || '').length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+  function hslToRgb(h, s, l) {
+    const a = s * Math.min(l, 1 - l);
+    const f = (n) => {
+      const k = (n + h / 30) % 12;
+      return l - a * Math.max(-1, Math.min(k - 3, Math.min(9 - k, 1)));
+    };
+    return [Math.round(f(0) * 255), Math.round(f(8) * 255), Math.round(f(4) * 255)];
+  }
+  function portalColorsFor(ownerId, slot) {
+    const baseHue = hashString(ownerId || 'local') % 360;
+    const hue = (baseHue + (slot === 1 ? 180 : 0)) % 360;
+    const [r, g, b] = hslToRgb(hue, 0.85, 0.58);
+    const [br, bg, bb] = hslToRgb(hue, 0.85, 0.72);
+    const [ir, ig, ib] = hslToRgb(hue, 0.85, 0.42);
+    const [dr, dg, db] = hslToRgb(hue, 0.85, 0.16);
+    const [vr, vg, vb] = hslToRgb(hue, 0.8, 0.06);
+    const hex = (rr, gg, bb2) => '#' + ((1 << 24) + (rr << 16) + (gg << 8) + bb2).toString(16).slice(1);
+    return {
+      col: hex(r, g, b),
+      colBright: hex(br, bg, bb),
+      colInner: hex(ir, ig, ib),
+      colDark: hex(dr, dg, db),
+      colVoid: hex(vr, vg, vb),
+      glow: `rgba(${r},${g},${b},0.5)`
+    };
+  }
+
+  // Renders one portal with the full animated Portal-2 look. `pt.slot` is the
+  // per-owner slot (0=A, 1=B) so placement order is visually stable. Each owner
+  // gets a unique hue pair so two players' portals can't be confused.
+  function drawPortal(pt, cam) {
+    const slot = pt.slot === 1 ? 1 : 0;
+    const ptx = pt.x - cam, pty = H - pt.y;
+    const { col, colBright, colInner, colDark, colVoid, glow } = portalColorsFor(pt.ownerId, slot);
+    const pulse = 0.7 + Math.sin(frameTick * 0.08 + slot * 3) * 0.3;
+
+    const PW = 12, PH = 48;
+    const px = Math.floor(ptx - PW / 2), py = Math.floor(pty - PH / 2);
+
+    ctx.save();
+
+    ctx.shadowColor = glow; ctx.shadowBlur = 24 * pulse;
+    ctx.fillStyle = colDark; ctx.globalAlpha = 0.6 * pulse;
+    ctx.fillRect(px - 3, py - 3, PW + 6, PH + 6);
+    ctx.shadowBlur = 0;
+
+    ctx.fillStyle = colVoid; ctx.globalAlpha = 0.95;
+    ctx.fillRect(px + 2, py + 2, PW - 4, PH - 4);
+
+    for (let sy = 0; sy < PH - 4; sy += 2) {
+      const bandPhase = (frameTick * 0.12 + sy * 0.5 + slot * 50) % (PH + 8);
+      const bandAlpha = Math.sin(bandPhase / PH * Math.PI) * 0.35 * pulse;
+      if (bandAlpha > 0.02) {
+        ctx.fillStyle = colInner; ctx.globalAlpha = bandAlpha;
+        ctx.fillRect(px + 2, py + 2 + sy, PW - 4, 2);
+      }
+    }
+
+    for (let k = 0; k < 3; k++) {
+      const streakY = ((frameTick * 0.8 + k * 17 + slot * 40) % (PH - 8)) + 4;
+      ctx.fillStyle = colBright; ctx.globalAlpha = 0.4 * pulse;
+      ctx.fillRect(px + 3, py + Math.floor(streakY), PW - 6, 1);
+    }
+
+    ctx.globalAlpha = pulse;
+    ctx.strokeStyle = col; ctx.lineWidth = 2;
+    ctx.strokeRect(px, py, PW, PH);
+
+    ctx.strokeStyle = colInner; ctx.lineWidth = 1; ctx.globalAlpha = 0.7 * pulse;
+    ctx.strokeRect(px + 1, py + 1, PW - 2, PH - 2);
+
+    ctx.fillStyle = colBright; ctx.globalAlpha = pulse * 0.9;
+    ctx.fillRect(px - 1, py - 1, 3, 3);
+    ctx.fillRect(px + PW - 2, py - 1, 3, 3);
+    ctx.fillRect(px - 1, py + PH - 2, 3, 3);
+    ctx.fillRect(px + PW - 2, py + PH - 2, 3, 3);
+
+    for (let p = 0; p < 8; p++) {
+      const t = ((frameTick * 0.025 + p / 8 + slot * 0.5) % 1);
+      const edgeY = py + t * PH;
+      const side = (p % 2 === 0) ? -1 : 1;
+      const drift = Math.sin(frameTick * 0.06 + p * 1.7) * 6;
+      const edgeX = ptx + side * (PW / 2 + 2 + Math.abs(drift));
+      const pAlpha = Math.sin(t * Math.PI) * pulse * 0.7;
+      ctx.fillStyle = col; ctx.globalAlpha = pAlpha;
+      ctx.fillRect(Math.floor(edgeX) - 1, Math.floor(edgeY) - 1, 2, 2);
+    }
+
+    for (let p = 0; p < 4; p++) {
+      const t = ((frameTick * 0.03 + p / 4 + slot * 0.3) % 1);
+      const edgeX = px + 2 + t * (PW - 4);
+      const topBot = (p % 2 === 0) ? -1 : 1;
+      const drift = Math.sin(frameTick * 0.07 + p * 2.3) * 5;
+      const edgeY = pty + topBot * (PH / 2 + 2 + Math.abs(drift));
+      const pAlpha = Math.sin(t * Math.PI) * pulse * 0.5;
+      ctx.fillStyle = col; ctx.globalAlpha = pAlpha;
+      ctx.fillRect(Math.floor(edgeX) - 1, Math.floor(edgeY) - 1, 2, 2);
+    }
+
+    ctx.restore();
+
+    ctx.fillStyle = col; ctx.font = '8px ' + FONT_MONO; ctx.textAlign = 'center';
+    ctx.fillText(slot === 0 ? 'A' : 'B', ptx, py - 6); ctx.textAlign = 'left';
+  }
+
+  function drawMultiplayerPlayer(player, cam, isLocal) {
+    const dead = player.health != null && player.health <= 0;
+    if (dead) {
+      drawPlayerCorpseSprite(
+        player.x,
+        player.y,
+        player.direction,
+        cam,
+        isLocal ? COL.bright : COL.primary,
+        player.damageFlash || 0
+      );
+      if (player.name) {
+        const px = player.x - cam;
+        const py = H - player.y - CHAR_H;
+        ctx.fillStyle = isLocal ? COL.cyan : COL.mid;
+        ctx.font = '9px ' + FONT_MONO;
+        ctx.textAlign = 'center';
+        ctx.fillText(player.name.toUpperCase(), px + CHAR_W / 2, py - 8);
+        ctx.textAlign = 'left';
+      }
+      return;
+    }
+
+    const moving = Math.abs(player.vx || 0) > 0.15;
+    const crouching = !!player.crouching;
+    const hitH = crouching ? CHAR_H_CROUCH : CHAR_H;
+    const px = player.x - cam;
+    const py = H - player.y - CHAR_H;
+
+    // Grapple rope — drawn BEFORE the sprite so the rope anchors under the
+    // player rather than over them. Same geometry/colour as the local rope.
+    if (player.grapple) {
+      const g = player.grapple;
+      const gpx = player.x + CHAR_W / 2 - cam;
+      const gpy = H - player.y - hitH / 2;
+      const gtx = g.tx - cam, gty = H - g.ty;
+      ctx.save();
+      ctx.strokeStyle = COL.amber; ctx.lineWidth = 2;
+      ctx.shadowColor = 'rgba(255,204,0,0.4)'; ctx.shadowBlur = 6;
+      ctx.beginPath(); ctx.moveTo(gpx, gpy); ctx.lineTo(gtx, gty); ctx.stroke();
+      ctx.fillStyle = COL.amber;
+      ctx.beginPath(); ctx.arc(gtx, gty, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+
+    // dash afterimage (same geometry as local `state.dashActive` block in render())
+    if ((player.dashSeconds || 0) > 0) {
+      const ph = hitH;
+      ctx.save(); ctx.globalAlpha = 0.3;
+      ctx.fillStyle = COL.amber;
+      for (let di = 1; di <= 3; di++) {
+        const off = di * 10 * ((player.direction || 'right') === 'right' ? -1 : 1);
+        ctx.globalAlpha = 0.3 - di * 0.08;
+        ctx.fillRect(px + off, py + (CHAR_H - ph), CHAR_W, ph);
+      }
+      ctx.restore();
+    }
+
+    ctx.save(); ctx.imageSmoothingEnabled = false;
+    if ((player.direction || 'right') === 'left') { ctx.translate(px + CHAR_W, py); ctx.scale(-1, 1); }
+    else ctx.translate(px, py);
+    let playerImg;
+    if (crouching && moving) playerImg = assets[crouchWalkImages[Math.floor(frameTick / 8) % crouchWalkImages.length]];
+    else if (crouching) playerImg = assets.idle_2_crouch;
+    else if (moving) playerImg = assets[idleImages[Math.floor(frameTick / 8) % idleImages.length]];
+    else playerImg = assets.idle_2;
+    if (playerImg && playerImg.complete) ctx.drawImage(playerImg, 0, 0, CHAR_W, CHAR_H);
+    else { ctx.fillStyle = isLocal ? COL.bright : COL.primary; ctx.fillRect(0, 0, CHAR_W, CHAR_H); }
+    if (player.damageFlash > 0) {
+      ctx.globalCompositeOperation = 'source-atop';
+      ctx.fillStyle = `rgba(255,51,51,${Math.min(0.6, (player.damageFlash || 0) / 12 * 0.6)})`;
+      ctx.fillRect(0, 0, CHAR_W, CHAR_H);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+    ctx.imageSmoothingEnabled = true; ctx.restore();
+
+    // Sword swing — mirrors the local render block; geometry is in world
+    // space so no additional flipping is needed.
+    if (player.swordSwing && player.swordSwing.frame <= 12) {
+      const sw = player.swordSwing;
+      const scx = player.x + CHAR_W / 2 - cam;
+      const scy = H - player.y - hitH / 2;
+      const dirMul = sw.direction === 'right' ? 1 : -1;
+      const progress = sw.frame / 12;
+      const baseAngle = sw.direction === 'right' ? -Math.PI / 3 : Math.PI + Math.PI / 3;
+      const sweep = dirMul * Math.PI * 2 / 3 * progress;
+      const len = 42;
+      const alpha = sw.frame <= 8 ? 1 : 1 - (sw.frame - 8) / 4;
+      const endX = scx + Math.cos(baseAngle + sweep) * len;
+      const endY = scy + Math.sin(baseAngle + sweep) * len;
+
+      ctx.save(); ctx.globalAlpha = alpha;
+      ctx.strokeStyle = COL.bright; ctx.lineWidth = 3;
+      ctx.shadowColor = COL.glowStrong; ctx.shadowBlur = 10;
+      ctx.beginPath(); ctx.moveTo(scx, scy); ctx.lineTo(endX, endY); ctx.stroke();
+      ctx.strokeStyle = COL.primary; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(scx, scy, len, baseAngle, baseAngle + sweep, dirMul < 0);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    if (player.name) {
+      ctx.fillStyle = isLocal ? COL.cyan : COL.mid;
+      ctx.font = '9px ' + FONT_MONO;
+      ctx.textAlign = 'center';
+      ctx.fillText(player.name.toUpperCase(), px + CHAR_W / 2, py - 8);
+      ctx.textAlign = 'left';
+    }
+  }
+
+  function presentCrtFrame() {
+    if (!crtRenderer || !menu.crtEnabled) return;
+    crtRenderer.render(performance.now() * 0.001);
+  }
 
   let lastPlayingClass = false;
   function render() {
+    syncMultiplayerPanel();
     const isPlaying = state.phase === 'playing' || state.phase === 'paused';
     if (isPlaying !== lastPlayingClass) {
       gameWrapper.classList.toggle('game-playing', isPlaying);
@@ -1631,11 +2211,27 @@
     }
     ctx.clearRect(0, 0, W, H);
     frameTick++;
+    tickFps(performance.now());
 
-    if (state.phase === 'menu') { fetchLeaderboard(); updateHotbarDOM(); drawMenu(); return; }
+    if (state.phase === 'menu') {
+      fetchLeaderboard();
+      updateHotbarDOM();
+      drawMenu();
+      presentCrtFrame();
+      return;
+    }
+
+    maybeSendDraftUpdate();
 
     const cam = state.cameraX;
+    const camY = state.cameraY || 0;
     drawSkyAndStars(cam);
+
+    // Vertical camera is applied as a canvas translation so we don't have to thread
+    // `camY` through every `H - y` conversion in the renderer. HUD and overlays are
+    // drawn after we restore.
+    ctx.save();
+    ctx.translate(0, camY);
 
     ctx.strokeStyle = COL.dim;
     ctx.lineWidth = 1;
@@ -1731,13 +2327,15 @@
       ctx.setLineDash([]);
     }
 
+    const drawSnapCursor = drawSnapAltHeld ? snapWorldPointToGrid(mouseWorld) : mouseWorld;
+
     // polygon preview — draw lines between clicked points
     if (state.polyPoints.length > 0) {
       ctx.setLineDash([5, 5]); ctx.strokeStyle = COL.cyan; ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(state.polyPoints[0].x - cam, H - state.polyPoints[0].y);
       for (let pi = 1; pi < state.polyPoints.length; pi++) ctx.lineTo(state.polyPoints[pi].x - cam, H - state.polyPoints[pi].y);
-      if (mouseOnCanvas) ctx.lineTo(mouseWorld.x - cam, H - mouseWorld.y);
+      if (mouseOnCanvas) ctx.lineTo(drawSnapCursor.x - cam, H - drawSnapCursor.y);
       ctx.stroke(); ctx.setLineDash([]);
       for (const pp of state.polyPoints) {
         ctx.fillStyle = COL.cyan;
@@ -1752,12 +2350,12 @@
       if (bp.length === 1 && mouseOnCanvas) {
         ctx.beginPath();
         ctx.moveTo(bp[0].x - cam, H - bp[0].y);
-        ctx.lineTo(mouseWorld.x - cam, H - mouseWorld.y);
+        ctx.lineTo(drawSnapCursor.x - cam, H - drawSnapCursor.y);
         ctx.stroke();
       } else if (bp.length === 2 && mouseOnCanvas) {
         ctx.beginPath();
         ctx.moveTo(bp[0].x - cam, H - bp[0].y);
-        ctx.quadraticCurveTo(mouseWorld.x - cam, H - mouseWorld.y, bp[1].x - cam, H - bp[1].y);
+        ctx.quadraticCurveTo(drawSnapCursor.x - cam, H - drawSnapCursor.y, bp[1].x - cam, H - bp[1].y);
         ctx.stroke();
       }
       ctx.setLineDash([]);
@@ -1767,95 +2365,26 @@
       }
     }
 
-    // portals — Portal 2 style rectangular, pixelated
-    for (let i = 0; i < state.portals.length; i++) {
-      const pt = state.portals[i];
-      const ptx = pt.x - cam, pty = H - pt.y;
-      const col = i === 0 ? '#3399ff' : '#ff8c1a';
-      const colBright = i === 0 ? '#66bbff' : '#ffaa44';
-      const colInner = i === 0 ? '#1a6dd6' : '#cc6600';
-      const colDark = i === 0 ? '#0a2244' : '#331a00';
-      const colVoid = i === 0 ? '#050e1a' : '#1a0d00';
-      const glow = i === 0 ? 'rgba(51,153,255,0.5)' : 'rgba(255,140,26,0.5)';
-      const pulse = 0.7 + Math.sin(frameTick * 0.08 + i * 3) * 0.3;
+    // remote-player drafts — render what other players are currently drawing
+    // before they commit it. Animated dash offset makes it legible at a glance
+    // that this is live / in-progress, not a placed shape.
+    if (multiplayer.active && multiplayer.remotePlayers.length > 0) {
+      for (const rp of multiplayer.remotePlayers) {
+        if (rp && rp.drawDraft) drawRemoteDraft(rp.drawDraft, cam, rp.name);
+      }
+    }
 
-      const PW = 12, PH = 48;
-      const px = Math.floor(ptx - PW / 2), py = Math.floor(pty - PH / 2);
-
-      ctx.save();
-
-      // ambient glow behind portal
-      ctx.shadowColor = glow; ctx.shadowBlur = 24 * pulse;
-      ctx.fillStyle = colDark; ctx.globalAlpha = 0.6 * pulse;
-      ctx.fillRect(px - 3, py - 3, PW + 6, PH + 6);
-      ctx.shadowBlur = 0;
-
-      // inner void
-      ctx.fillStyle = colVoid; ctx.globalAlpha = 0.95;
-      ctx.fillRect(px + 2, py + 2, PW - 4, PH - 4);
-
-      // scrolling energy bands inside the portal
-      for (let sy = 0; sy < PH - 4; sy += 2) {
-        const bandPhase = (frameTick * 0.12 + sy * 0.5 + i * 50) % (PH + 8);
-        const bandAlpha = Math.sin(bandPhase / PH * Math.PI) * 0.35 * pulse;
-        if (bandAlpha > 0.02) {
-          ctx.fillStyle = colInner; ctx.globalAlpha = bandAlpha;
-          ctx.fillRect(px + 2, py + 2 + sy, PW - 4, 2);
+    // portals — Portal 2 style rectangular, pixelated.
+    // Draw every visible portal (local + remote) with the same visuals; the
+    // sim's per-player slot (0=A, 1=B) drives the colour so a remote player's
+    // A still looks blue, their B still looks orange.
+    for (const pt of state.portals) drawPortal(pt, cam);
+    if (multiplayer.active && multiplayer.remotePlayers.length > 0) {
+      for (const rp of multiplayer.remotePlayers) {
+        if (rp && rp.portals && rp.portals.length) {
+          for (const pt of rp.portals) drawPortal(pt, cam);
         }
       }
-
-      // bright horizontal streaks (pixelated energy)
-      for (let k = 0; k < 3; k++) {
-        const streakY = ((frameTick * 0.8 + k * 17 + i * 40) % (PH - 8)) + 4;
-        ctx.fillStyle = colBright; ctx.globalAlpha = 0.4 * pulse;
-        ctx.fillRect(px + 3, py + Math.floor(streakY), PW - 6, 1);
-      }
-
-      // outer frame — bright border
-      ctx.globalAlpha = pulse;
-      ctx.strokeStyle = col; ctx.lineWidth = 2;
-      ctx.strokeRect(px, py, PW, PH);
-
-      // inner frame — slightly inset
-      ctx.strokeStyle = colInner; ctx.lineWidth = 1; ctx.globalAlpha = 0.7 * pulse;
-      ctx.strokeRect(px + 1, py + 1, PW - 2, PH - 2);
-
-      // corner highlights (brighter pixels at corners, Portal 2 style)
-      ctx.fillStyle = colBright; ctx.globalAlpha = pulse * 0.9;
-      ctx.fillRect(px - 1, py - 1, 3, 3);
-      ctx.fillRect(px + PW - 2, py - 1, 3, 3);
-      ctx.fillRect(px - 1, py + PH - 2, 3, 3);
-      ctx.fillRect(px + PW - 2, py + PH - 2, 3, 3);
-
-      // floating pixel particles along the edges
-      for (let p = 0; p < 8; p++) {
-        const t = ((frameTick * 0.025 + p / 8 + i * 0.5) % 1);
-        const edgeY = py + t * PH;
-        const side = (p % 2 === 0) ? -1 : 1;
-        const drift = Math.sin(frameTick * 0.06 + p * 1.7) * 6;
-        const edgeX = ptx + side * (PW / 2 + 2 + Math.abs(drift));
-        const pAlpha = Math.sin(t * Math.PI) * pulse * 0.7;
-        ctx.fillStyle = col; ctx.globalAlpha = pAlpha;
-        ctx.fillRect(Math.floor(edgeX) - 1, Math.floor(edgeY) - 1, 2, 2);
-      }
-
-      // top/bottom edge particles
-      for (let p = 0; p < 4; p++) {
-        const t = ((frameTick * 0.03 + p / 4 + i * 0.3) % 1);
-        const edgeX = px + 2 + t * (PW - 4);
-        const topBot = (p % 2 === 0) ? -1 : 1;
-        const drift = Math.sin(frameTick * 0.07 + p * 2.3) * 5;
-        const edgeY = pty + topBot * (PH / 2 + 2 + Math.abs(drift));
-        const pAlpha = Math.sin(t * Math.PI) * pulse * 0.5;
-        ctx.fillStyle = col; ctx.globalAlpha = pAlpha;
-        ctx.fillRect(Math.floor(edgeX) - 1, Math.floor(edgeY) - 1, 2, 2);
-      }
-
-      ctx.restore();
-
-      // label
-      ctx.fillStyle = col; ctx.font = '8px ' + FONT_MONO; ctx.textAlign = 'center';
-      ctx.fillText(i === 0 ? 'A' : 'B', ptx, py - 6); ctx.textAlign = 'left';
     }
 
     // coins
@@ -1882,6 +2411,28 @@
       ctx.restore();
       ctx.fillStyle = COL.red; ctx.font = '8px ' + FONT_MONO; ctx.textAlign = 'center';
       ctx.fillText('+' + h.heal + 'HP', hx, hy - 14); ctx.textAlign = 'left';
+    }
+
+    // revive tokens (coop) — pulsating green cross, falls into the pool of
+    // pickups only when someone on the team is waiting to respawn.
+    if (state.revives && state.revives.length) {
+      for (const r of state.revives) {
+        const rx = r.x - cam, ry = H - r.y;
+        const pulse = 0.6 + Math.sin(frameTick * 0.12) * 0.4;
+        ctx.save();
+        ctx.shadowColor = `rgba(102,255,140,${pulse * 0.7})`;
+        ctx.shadowBlur = 14;
+        ctx.fillStyle = `rgba(102,255,140,${pulse})`;
+        const s = 8;
+        ctx.fillRect(Math.floor(rx) - 2, Math.floor(ry) - s, 4, s * 2);
+        ctx.fillRect(Math.floor(rx) - s, Math.floor(ry) - 2, s * 2, 4);
+        ctx.restore();
+        ctx.fillStyle = '#66ff8c';
+        ctx.font = '8px ' + FONT_MONO;
+        ctx.textAlign = 'center';
+        ctx.fillText('REVIVE', rx, ry - 14);
+        ctx.textAlign = 'left';
+      }
     }
 
     // upgrade pickups (drawn as a little diamond)
@@ -1958,7 +2509,7 @@
     // grapple rope
     if (state.grapple) {
       const g = state.grapple;
-      const gpx = state.playerX + CHAR_W / 2 - cam, gpy = H - (-state.playerY) - CHAR_H / 2;
+      const gpx = state.playerX + CHAR_W / 2 - cam, gpy = H - state.playerY - playerHitH() / 2;
       const gtx = g.tx - cam, gty = H - g.ty;
       ctx.save();
       ctx.strokeStyle = COL.amber; ctx.lineWidth = 2;
@@ -1984,21 +2535,23 @@
     }
 
     // dash afterimage
-    if (state.dashActive > 0) {
-      const dtx = state.playerX - cam, dty = H - (-state.playerY) - CHAR_H;
+    if (state.health > 0 && state.dashActive > 0) {
+      const ph = playerHitH();
+      const dtx = state.playerX - cam, dty = H - state.playerY - CHAR_H;
       ctx.save(); ctx.globalAlpha = 0.3;
       ctx.fillStyle = COL.amber;
       for (let di = 1; di <= 3; di++) {
         const off = di * 10 * (state.direction === 'right' ? -1 : 1);
         ctx.globalAlpha = 0.3 - di * 0.08;
-        ctx.fillRect(dtx + off, dty, CHAR_W, CHAR_H);
+        ctx.fillRect(dtx + off, dty + (CHAR_H - ph), CHAR_W, ph);
       }
       ctx.restore();
     }
 
     // glide wing lines above player
-    if (state.activeUpgrades.glide && !state.onGround && state.playerVY > 0 && (keys['Space'] || keys['ArrowUp'] || keys['KeyW'])) {
-      const glx = state.playerX + CHAR_W / 2 - cam, gly = H - (-state.playerY) - CHAR_H - 4;
+    // sim is Y-up: vy < 0 means falling, which is when the glide cosmetic should show.
+    if (state.health > 0 && state.activeUpgrades.glide && !state.onGround && state.playerVY < 0 && (state.mobileJumpHeld || keys['Space'] || keys['ArrowUp'] || keys['KeyW'])) {
+      const glx = state.playerX + CHAR_W / 2 - cam, gly = H - state.playerY - playerHitH() - 4;
       ctx.save(); ctx.globalAlpha = 0.4;
       ctx.strokeStyle = COL.primary; ctx.lineWidth = 1;
       ctx.beginPath();
@@ -2007,33 +2560,58 @@
       ctx.restore();
     }
 
-    // player sprite
-    const isMoving = state.movingLeft || state.movingRight;
-    const px = state.playerX - cam, py = H - (-state.playerY) - CHAR_H;
-    ctx.save(); ctx.imageSmoothingEnabled = false;
-    if (state.direction === 'left') { ctx.translate(px + CHAR_W, py); ctx.scale(-1, 1); }
-    else ctx.translate(px, py);
-    let playerImg;
-    if (isMoving) {
-      walkTimer++;
-      if (walkTimer > ((state.sprinting && state.activeUpgrades.sprint) ? 5 : 8)) { walkTimer = 0; walkFrame = (walkFrame + 1) % 3; }
-      playerImg = assets[idleImages[walkFrame]];
-    } else { playerImg = assets[state.idleImg]; walkFrame = 0; walkTimer = 0; }
-    if (playerImg && playerImg.complete) ctx.drawImage(playerImg, 0, 0, CHAR_W, CHAR_H);
-    else { ctx.fillStyle = COL.primary; ctx.fillRect(0, 0, CHAR_W, CHAR_H); }
-    if (state.damageFlash > 0) {
-      ctx.globalCompositeOperation = 'source-atop';
-      ctx.fillStyle = `rgba(255,51,51,${state.damageFlash / 12 * 0.6})`;
-      ctx.fillRect(0, 0, CHAR_W, CHAR_H);
-      ctx.globalCompositeOperation = 'source-over';
+    if (multiplayer.active && multiplayer.remotePlayers.length > 0) {
+      for (const rp of multiplayer.remotePlayers) drawMultiplayerPlayer(rp, cam, false);
     }
-    ctx.imageSmoothingEnabled = true; ctx.restore();
+
+    // player sprite (prone corpse while dead / waiting to respawn)
+    if (state.health <= 0) {
+      drawPlayerCorpseSprite(state.playerX, state.playerY, state.direction, cam, COL.primary, state.damageFlash);
+    } else {
+      const isMoving = state.movingLeft || state.movingRight;
+      const px = state.playerX - cam, py = H - state.playerY - CHAR_H;
+      ctx.save(); ctx.imageSmoothingEnabled = false;
+      if (state.direction === 'left') { ctx.translate(px + CHAR_W, py); ctx.scale(-1, 1); }
+      else ctx.translate(px, py);
+      let playerImg;
+      if (state.crouching && isMoving) {
+        walkFrame = 0; walkTimer = 0;
+        crouchWalkTimer++;
+        if (crouchWalkTimer > 7) {
+          crouchWalkTimer = 0;
+          crouchWalkFrame = (crouchWalkFrame + 1) % crouchWalkImages.length;
+        }
+        playerImg = assets[crouchWalkImages[crouchWalkFrame]];
+      } else if (state.crouching) {
+        walkFrame = 0; walkTimer = 0;
+        crouchWalkFrame = 0; crouchWalkTimer = 0;
+        playerImg = assets.idle_2_crouch;
+      } else if (isMoving) {
+        crouchWalkFrame = 0; crouchWalkTimer = 0;
+        walkTimer++;
+        if (walkTimer > (isSprintActive() ? 5 : 8)) { walkTimer = 0; walkFrame = (walkFrame + 1) % 3; }
+        playerImg = assets[idleImages[walkFrame]];
+      } else {
+        playerImg = assets[state.idleImg];
+        walkFrame = 0; walkTimer = 0;
+        crouchWalkFrame = 0; crouchWalkTimer = 0;
+      }
+      if (playerImg && playerImg.complete) ctx.drawImage(playerImg, 0, 0, CHAR_W, CHAR_H);
+      else { ctx.fillStyle = COL.primary; ctx.fillRect(0, 0, CHAR_W, CHAR_H); }
+      if (state.damageFlash > 0) {
+        ctx.globalCompositeOperation = 'source-atop';
+        ctx.fillStyle = `rgba(255,51,51,${state.damageFlash / 12 * 0.6})`;
+        ctx.fillRect(0, 0, CHAR_W, CHAR_H);
+        ctx.globalCompositeOperation = 'source-over';
+      }
+      ctx.imageSmoothingEnabled = true; ctx.restore();
+    }
 
     // sword swing animation
-    if (state.swordSwing && state.swordSwing.frame <= 12) {
+    if (state.health > 0 && state.swordSwing && state.swordSwing.frame <= 12) {
       const sw = state.swordSwing;
       const scx = state.playerX + CHAR_W / 2 - cam;
-      const scy = H - (-state.playerY) - CHAR_H / 2;
+      const scy = H - state.playerY - playerHitH() / 2;
       const dirMul = sw.direction === 'right' ? 1 : -1;
       const progress = sw.frame / 12;
       const baseAngle = sw.direction === 'right' ? -Math.PI / 3 : Math.PI + Math.PI / 3;
@@ -2217,16 +2795,18 @@
       ctx.restore();
     }
 
-    // laser beams — bright red streak
+    // laser — one red circle per shot (sim stores position + velocity; life is seconds)
     for (const l of state.laserBeams) {
       const lx = l.x - cam, ly = H - l.y;
-      const alpha = Math.min(1, l.life / 15);
-      ctx.save(); ctx.globalAlpha = alpha;
-      ctx.shadowColor = 'rgba(255,50,50,0.7)'; ctx.shadowBlur = 10;
-      ctx.strokeStyle = COL.red; ctx.lineWidth = 3;
-      ctx.beginPath(); ctx.moveTo(lx - l.vx * 2, ly); ctx.lineTo(lx, ly); ctx.stroke();
-      ctx.strokeStyle = '#ff8888'; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.moveTo(lx - l.vx * 2, ly); ctx.lineTo(lx, ly); ctx.stroke();
+      const alpha = Math.min(1, l.life * 2);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.shadowColor = 'rgba(255,50,50,0.65)';
+      ctx.shadowBlur = 6;
+      ctx.fillStyle = COL.red;
+      ctx.beginPath();
+      ctx.arc(lx, ly, 3.5, 0, Math.PI * 2);
+      ctx.fill();
       ctx.restore();
     }
 
@@ -2261,6 +2841,8 @@
         ctx.restore();
       }
     }
+
+    ctx.restore();
 
     drawHUD();
     updateHotbarDOM();
@@ -2326,19 +2908,31 @@
 
       ctx.save(); ctx.shadowColor = COL.glowStrong; ctx.shadowBlur = 16;
       ctx.fillStyle = COL.bright; ctx.font = 'bold 28px ' + FONT_DISPLAY; ctx.textAlign = 'center';
-      ctx.fillText('PAUSED', W / 2, panelY + 74); ctx.restore();
+      ctx.fillText(multiplayer.active ? 'MATCH MENU' : 'PAUSED', W / 2, panelY + 74); ctx.restore();
 
-      ctx.font = '12px ' + FONT_MONO; ctx.textAlign = 'center';
-      ctx.fillStyle = COL.mid;
-      ctx.fillText('ESC / ENTER / SPACE  \u2500  RESUME', W / 2, panelY + 115);
-      ctx.fillStyle = COL.dim;
-      ctx.fillText('Q  \u2500  QUIT TO MENU', W / 2, panelY + 140);
+      const hintPx = W < 360 ? 9 : W < 480 ? 10 : 12;
+      ctx.font = hintPx + 'px ' + FONT_MONO;
+      ctx.textAlign = 'center';
+      const exitLabel = multiplayer.active ? 'LEAVE MATCH' : 'MAIN MENU';
+      if (isMobilePauseHints()) {
+        ctx.fillStyle = COL.mid;
+        ctx.fillText('OUTSIDE / ESC / \u2630  \u2500  RESUME', W / 2, panelY + 115);
+        ctx.fillStyle = COL.dim;
+        ctx.fillText('TAP BOX  \u2500  ' + exitLabel, W / 2, panelY + 138);
+      } else {
+        ctx.fillStyle = COL.mid;
+        ctx.fillText('OUTSIDE / ESC / ENTER / SPACE  \u2500  RESUME', W / 2, panelY + 115);
+        ctx.fillStyle = COL.dim;
+        ctx.fillText('PANEL / Q  \u2500  ' + exitLabel, W / 2, panelY + 138);
+      }
 
       const elapsed = Math.floor((state.pauseStart - state.gameStartTime) / 1000);
       ctx.fillStyle = COL.shadow; ctx.font = '10px ' + FONT_MONO;
       ctx.fillText('T+' + String(Math.floor(elapsed / 60)).padStart(2, '0') + ':' + String(elapsed % 60).padStart(2, '0') + '  \u2502  SCORE: ' + state.score, W / 2, panelY + 168);
       ctx.textAlign = 'left';
     }
+
+    presentCrtFrame();
   }
 
   // HUD — health bar, score, active upgrade tags, timer, coords
@@ -2346,6 +2940,11 @@
     const x = 10, y = 8;
     const hp = Math.max(0, state.health);
     const barW = 120, barH = 12;
+
+    const hudMobile = isMobilePauseHints();
+    const mpConnected = multiplayer.active && multiplayer.connected;
+    const scoreSecondRow = hudMobile && mpConnected;
+    const tagRightPad = mpConnected ? 220 : 10;
 
     ctx.fillStyle = COL.mid; ctx.font = '10px ' + FONT_MONO;
     ctx.fillText('HP', x, y + 10);
@@ -2365,15 +2964,46 @@
 
     ctx.fillStyle = hp > 50 ? COL.primary : hp > 25 ? COL.amberPri : COL.red;
     ctx.font = '10px ' + FONT_MONO;
-    ctx.fillText(hp + '%', x + 22 + barW + 6, y + 10);
+    const hpPctX = x + 22 + barW + 6;
+    ctx.fillText(hp + '%', hpPctX, y + 10);
+    const hpRowTagStart = hpPctX + ctx.measureText(hp + '%').width + 16;
 
+    const scoreBaselineY = scoreSecondRow ? y + 22 : y + 10;
     const scoreX = x + 22 + barW + 50;
-    ctx.fillStyle = COL.mid; ctx.font = '10px ' + FONT_MONO; ctx.fillText('SCORE:', scoreX, y + 10);
-    ctx.fillStyle = COL.bright;
-    ctx.save(); ctx.shadowColor = COL.glowWeak; ctx.shadowBlur = 6;
-    ctx.fillText(String(state.score), scoreX + 52, y + 10); ctx.restore();
+    if (scoreSecondRow) {
+      const scoreLeft = x + 22;
+      const maxRight = W - tagRightPad;
+      let px = 10;
+      for (; px >= 8; px--) {
+        ctx.font = px + 'px ' + FONT_MONO;
+        const numX = scoreLeft + ctx.measureText('SCORE:').width + 4;
+        const totalRight = numX + ctx.measureText(String(state.score)).width;
+        if (totalRight <= maxRight || px === 8) break;
+      }
+      ctx.fillStyle = COL.mid;
+      ctx.fillText('SCORE:', scoreLeft, scoreBaselineY);
+      ctx.fillStyle = COL.bright;
+      ctx.save(); ctx.shadowColor = COL.glowWeak; ctx.shadowBlur = 6;
+      ctx.fillText(String(state.score), scoreLeft + ctx.measureText('SCORE:').width + 4, scoreBaselineY);
+      ctx.restore();
+    } else {
+      ctx.font = '10px ' + FONT_MONO;
+      ctx.fillStyle = COL.mid;
+      ctx.fillText('SCORE:', scoreX, scoreBaselineY);
+      ctx.fillStyle = COL.bright;
+      ctx.save(); ctx.shadowColor = COL.glowWeak; ctx.shadowBlur = 6;
+      ctx.fillText(String(state.score), scoreX + 52, scoreBaselineY);
+      ctx.restore();
+    }
 
-    let tagX = scoreX + 52 + ctx.measureText(String(state.score)).width + 16;
+    ctx.font = '10px ' + FONT_MONO;
+    let tagX = scoreSecondRow
+      ? hpRowTagStart
+      : scoreX + 52 + ctx.measureText(String(state.score)).width + 16;
+    let tagY = y;
+    const tagGap = 16;
+    const tagLineH = scoreSecondRow ? 18 : 15;
+    const tagWrapX = x;
     ctx.font = '9px ' + FONT_MONO;
     const tags = [
       ['doubleJump', '2xJUMP', COL.cyanPri, COL.cyan],
@@ -2387,15 +3017,152 @@
       ['reinforce', 'REINF', COL.dim, COL.primary],
     ];
     for (const [key, label, bc, tc] of tags) {
-      if (state.activeUpgrades[key]) { drawTag(tagX, y, label, bc, tc); tagX += ctx.measureText(label).width + 16; }
+      if (!state.activeUpgrades[key]) continue;
+      const tw = ctx.measureText(label).width + 8;
+      if (tagX + tw > W - tagRightPad) {
+        tagX = tagWrapX;
+        tagY += tagLineH;
+      }
+      drawTag(tagX, tagY, label, bc, tc);
+      tagX += ctx.measureText(label).width + tagGap;
     }
 
     ctx.fillStyle = COL.shadow; ctx.font = '9px ' + FONT_MONO;
     const elapsed = Math.floor((Date.now() - state.gameStartTime) / 1000);
     ctx.fillText('T+' + String(Math.floor(elapsed / 60)).padStart(2, '0') + ':' + String(elapsed % 60).padStart(2, '0'), 10, H - 8);
     ctx.textAlign = 'right';
-    ctx.fillText('X:' + Math.floor(state.playerX) + ' Y:' + Math.floor(-state.playerY), W - 10, H - 8);
+    ctx.fillText('X:' + Math.floor(state.playerX) + ' Y:' + Math.floor(state.playerY), W - 10, H - 8);
     ctx.textAlign = 'left';
+
+    drawMultiplayerStats();
+  }
+
+  // Top-right multiplayer HUD: plain text, no panel. Left column = player count +
+  // names; right column = net stats (flush to screen right).
+  function drawMultiplayerStats() {
+    if (!multiplayer.active || !multiplayer.connected) return;
+    if (!session.handle || typeof session.handle.getStats !== 'function') return;
+
+    const stats = session.handle.getStats();
+    const snap = multiplayer.snapshot;
+
+    const rawPlayers = snap ? Object.values(snap.players || {}) : [];
+    const connected = rawPlayers.filter(p => p.connected).length;
+    const total = stats.playerCount || rawPlayers.length;
+    const connectedDisplay = Math.max(connected, stats.connectedCount || 0);
+
+    const pingMs = stats.pingMs >= 0 ? Math.round(stats.pingMs) : null;
+    const snapHz = stats.snapshotHz ? stats.snapshotHz.toFixed(0) : '--';
+    const fps = fpsMeter.value ? Math.round(fpsMeter.value) : null;
+    const room = (multiplayer.roomCode || snap?.roomId || '').toUpperCase();
+    const modeLabel = (snap?.mode || multiplayer.mode || 'COOP').toUpperCase();
+    const hostId = snap?.hostId;
+
+    const pingColor = pingMs == null ? COL.shadow
+      : pingMs < 80 ? COL.primary
+      : pingMs < 160 ? COL.amberPri
+      : COL.red;
+    const fpsColor = fps == null ? COL.shadow
+      : fps >= 55 ? COL.primary
+      : fps >= 30 ? COL.amberPri
+      : COL.red;
+    const netColor = stats.snapshotAgeMs > 1500 ? COL.amberPri
+      : stats.snapshotAgeMs > 500 ? COL.mid
+      : COL.primary;
+
+    const font = '9px ' + FONT_MONO;
+    const lineH = 11;
+    const rightPad = 10;
+    const colGap = 20;
+    const topBaseline = 10;
+
+    const sortedPlayers = rawPlayers.slice().sort((a, b) =>
+      String(a.name || '').localeCompare(String(b.name || ''), undefined, { sensitivity: 'base' })
+    );
+
+    ctx.save();
+    ctx.font = font;
+    ctx.textAlign = 'right';
+
+    const statRows = [
+      ['ROOM', room || '------', COL.bright],
+      ['MODE', modeLabel, COL.primary],
+      ['PING', pingMs == null ? '---MS' : pingMs + 'MS', pingColor],
+      ['NET', snapHz + 'HZ', netColor],
+      ['FPS', fps == null ? '--' : String(fps), fpsColor],
+    ];
+
+    const countLine = connectedDisplay + '/' + total + ' PLAYERS';
+    let playersColW = ctx.measureText(countLine).width;
+    for (const p of sortedPlayers) {
+      let line = String(p.name || 'ANON').toUpperCase().slice(0, 18);
+      if (p.id === multiplayer.localId) line += ' [YOU]';
+      if (hostId && p.id === hostId) line += ' [HOST]';
+      playersColW = Math.max(playersColW, ctx.measureText(line).width);
+    }
+
+    let statsColW = 0;
+    for (const [label, value] of statRows) {
+      statsColW = Math.max(statsColW, ctx.measureText(label + '  ' + value).width);
+    }
+
+    const statsRight = W - rightPad;
+    const playersRight = statsRight - statsColW - colGap;
+
+    function drawLabeledRow(label, value, valueColor, rightX, baseline) {
+      ctx.font = font;
+      ctx.fillStyle = valueColor;
+      ctx.textAlign = 'right';
+      ctx.fillText(value, rightX, baseline);
+      const vw = ctx.measureText(value).width;
+      ctx.fillStyle = COL.mid;
+      ctx.fillText(label + '  ', rightX - vw, baseline);
+    }
+
+    let y = topBaseline;
+    ctx.fillStyle = COL.mid;
+    ctx.textAlign = 'right';
+    ctx.fillText(countLine, playersRight, y);
+    y += lineH;
+
+    for (const p of sortedPlayers) {
+      let line = String(p.name || 'ANON').toUpperCase().slice(0, 18);
+      if (p.id === multiplayer.localId) line += ' [YOU]';
+      if (hostId && p.id === hostId) line += ' [HOST]';
+      const isYou = p.id === multiplayer.localId;
+      ctx.fillStyle = isYou ? COL.bright : COL.primary;
+      ctx.textAlign = 'right';
+      ctx.fillText(line, playersRight, y);
+      y += lineH;
+    }
+
+    const now = Date.now();
+    const liveNotifs = multiplayer.playerNotifs.filter(n => now - n.joinedAt < NOTIF_DURATION_MS);
+    multiplayer.playerNotifs = liveNotifs;
+    if (liveNotifs.length > 0) {
+      y += 4;
+      for (const notif of liveNotifs) {
+        const age = now - notif.joinedAt;
+        const fadeStart = NOTIF_DURATION_MS * 0.6;
+        const alpha = age > fadeStart
+          ? 1 - (age - fadeStart) / (NOTIF_DURATION_MS - fadeStart)
+          : 1;
+        const baseColor = notif.type === 'join' ? '255,255,85' : '170,170,170';
+        ctx.fillStyle = 'rgba(' + baseColor + ',' + alpha.toFixed(2) + ')';
+        ctx.textAlign = 'right';
+        ctx.fillText(notif.text, playersRight, y);
+        y += lineH;
+      }
+    }
+
+    y = topBaseline;
+    for (const [label, value, valueColor] of statRows) {
+      drawLabeledRow(label, value, valueColor, statsRight, y);
+      y += lineH;
+    }
+
+    ctx.textAlign = 'left';
+    ctx.restore();
   }
 
   function drawTag(x, y, label, borderCol, textCol) {
@@ -2464,6 +3231,7 @@
       ctx.fillRect(Math.random() * W, Math.random() * H, 1 + Math.random() * 2, 1);
     }
 
+    normalizeMenuSelection();
     const cx = W / 2;
     const chrome = getMenuChrome();
     const { padX, padY, titleY, compact } = chrome;
@@ -2497,41 +3265,137 @@
     ctx.save();
     ctx.translate(0, -scrollY);
 
+    if (menu.multiplayerMode) {
+      const mpStartIndex = items.indexOf('mp_room');
+      const mpEndIndex = items.indexOf('mp_status');
+      if (mpStartIndex >= 0 && mpEndIndex >= mpStartIndex) {
+        const startRow = layout[mpStartIndex];
+        const endRow = layout[mpEndIndex];
+        const startHalf = getMenuRowHeight(items[mpStartIndex]) / 2;
+        const endHalf = getMenuRowHeight(items[mpEndIndex]) / 2;
+        const panelTop = startRow.y - startHalf - 28;
+        const panelBottom = endRow.y + endHalf + 10;
+        const panelH = panelBottom - panelTop;
+        ctx.fillStyle = 'rgba(38, 28, 0, 0.92)';
+        ctx.fillRect(rowX - 4, panelTop, rowW + 8, panelH);
+        ctx.strokeStyle = 'rgba(255, 204, 0, 0.42)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(rowX - 4, panelTop, rowW + 8, panelH);
+        ctx.fillStyle = 'rgba(255, 204, 0, 0.08)';
+        ctx.fillRect(rowX - 3, panelTop + 1, rowW + 6, 22);
+        ctx.strokeStyle = 'rgba(255, 204, 0, 0.22)';
+        ctx.beginPath();
+        ctx.moveTo(rowX - 3, panelTop + 23);
+        ctx.lineTo(rowX + rowW + 3, panelTop + 23);
+        ctx.stroke();
+      }
+    }
+
     for (let i = 0; i < items.length; i++) {
-      const row = layout[i], selected = i === menu.selectedIndex, item = items[i];
+      const row = layout[i], item = items[i];
+      const selectable = isSelectableMenuItem(item);
+      const selected = selectable && i === menu.selectedIndex;
       const isCat = item.startsWith('cat_');
       const isCheat = item.startsWith('cheat_');
+      const labelX = colL + (selected ? 12 : 0);
       const isSmall = isCheat;
-      const rowH = isSmall ? 20 : 32;
+      const rowH = getMenuRowHeight(item);
       const rowHalf = rowH / 2;
 
       if (item === 'name') {
         ctx.fillStyle = COL.dim; ctx.font = '11px ' + FONT_MONO; ctx.textAlign = 'center';
         ctx.fillText('\u2500\u2500  PLAYER  \u2500\u2500', cx, row.y - 18);
+      } else if (item === 'mp_room') {
+        ctx.fillStyle = COL.amber; ctx.font = 'bold 11px ' + FONT_MONO; ctx.textAlign = 'center';
+        ctx.fillText('\u2500\u2500  MULTIPLAYER  \u2500\u2500', cx, row.y - 29);
       }
 
-      if (selected) {
-        ctx.fillStyle = COL.ghost; ctx.fillRect(rowX, row.y - rowHalf, rowW, rowH);
-        ctx.strokeStyle = COL.shadow; ctx.lineWidth = 1; ctx.strokeRect(rowX, row.y - rowHalf, rowW, rowH);
-        ctx.fillStyle = COL.bright; ctx.font = (isSmall ? '11' : '14') + 'px ' + FONT_MONO; ctx.textAlign = 'left';
+      if (selected && item !== 'mode') {
+        const mpSelected = isMultiplayerMenuItem(item);
+        ctx.fillStyle = mpSelected ? 'rgba(255, 204, 0, 0.10)' : COL.ghost;
+        ctx.fillRect(rowX, row.y - rowHalf, rowW, rowH);
+        ctx.strokeStyle = mpSelected ? 'rgba(255, 204, 0, 0.26)' : COL.shadow;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(rowX, row.y - rowHalf, rowW, rowH);
+        ctx.fillStyle = mpSelected ? COL.amber : COL.bright;
+        ctx.font = (isSmall ? '11' : '14') + 'px ' + FONT_MONO; ctx.textAlign = 'left';
         ctx.fillText('>', colL - 2, row.y + (isSmall ? 4 : 5));
       }
 
-      const textColor = selected ? COL.bright : COL.mid;
+      const textColor = isMultiplayerMenuItem(item)
+        ? (selected ? COL.amber : COL.amberPri)
+        : (selected ? COL.bright : COL.mid);
 
-      if (item === 'start') {
+      if (item === 'mode') {
+        const segLeft = rowX;
+        const segW = rowW;
+        const segHalf = segW / 2;
+        const top = row.y - rowHalf + 3;
+        const h = rowH - 6;
+        const soloOn = !menu.multiplayerMode;
+        const mpOn = menu.multiplayerMode;
+        let innerPadX = Math.max(3, Math.min(7, Math.floor(segHalf * 0.12)));
+        innerPadX = Math.min(innerPadX, Math.max(0, Math.floor((segHalf - 4) / 2)));
+        innerPadX = Math.max(2, innerPadX - 1);
+        const innerPadY = 5;
+
+        ctx.fillStyle = 'rgba(0, 10, 0, 0.5)';
+        ctx.fillRect(segLeft, top, segHalf, h);
+        ctx.fillStyle = 'rgba(20, 14, 0, 0.45)';
+        ctx.fillRect(segLeft + segHalf, top, segHalf, h);
+
+        if (soloOn && innerPadX * 2 < segHalf - 2 && innerPadY * 2 < h - 2) {
+          ctx.fillStyle = selected ? 'rgba(51, 255, 51, 0.24)' : 'rgba(51, 255, 51, 0.12)';
+          ctx.fillRect(segLeft + innerPadX, top + innerPadY, segHalf - innerPadX * 2, h - innerPadY * 2);
+          ctx.strokeStyle = selected ? 'rgba(51, 255, 51, 0.45)' : 'rgba(51, 255, 51, 0.22)';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(segLeft + innerPadX + 0.5, top + innerPadY + 0.5, segHalf - innerPadX * 2 - 1, h - innerPadY * 2 - 1);
+        }
+        if (mpOn && innerPadX * 2 < segHalf - 2 && innerPadY * 2 < h - 2) {
+          ctx.fillStyle = selected ? 'rgba(255, 204, 0, 0.22)' : 'rgba(255, 204, 0, 0.11)';
+          ctx.fillRect(segLeft + segHalf + innerPadX, top + innerPadY, segHalf - innerPadX * 2, h - innerPadY * 2);
+          ctx.strokeStyle = selected ? 'rgba(255, 204, 0, 0.5)' : 'rgba(255, 204, 0, 0.25)';
+          ctx.lineWidth = 1;
+          ctx.strokeRect(segLeft + segHalf + innerPadX + 0.5, top + innerPadY + 0.5, segHalf - innerPadX * 2 - 1, h - innerPadY * 2 - 1);
+        }
+
+        ctx.strokeStyle = selected ? COL.primary : COL.shadow;
+        ctx.lineWidth = selected ? 2 : 1;
+        ctx.strokeRect(rowX, top, rowW, h);
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.45)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(segLeft + segHalf, top);
+        ctx.lineTo(segLeft + segHalf, top + h);
+        ctx.stroke();
+
+        const mpLabel = rowW < 300 ? 'MULTI' : 'MULTIPLAYER';
+        ctx.font = (rowW < 280 ? '11px ' : '13px ') + FONT_MONO;
+        ctx.textAlign = 'center';
+        ctx.fillStyle = soloOn ? COL.bright : COL.dim;
+        ctx.save();
+        if (soloOn && selected) { ctx.shadowColor = COL.glowStrong; ctx.shadowBlur = 10; }
+        ctx.fillText('SOLO', segLeft + segHalf * 0.5, row.y + 5);
+        ctx.restore();
+        ctx.fillStyle = mpOn ? COL.amber : COL.amberDim;
+        ctx.save();
+        if (mpOn && selected) { ctx.shadowColor = 'rgba(255,204,0,0.4)'; ctx.shadowBlur = 10; }
+        ctx.fillText(mpLabel, segLeft + segHalf * 1.5, row.y + 5);
+        ctx.restore();
+      } else if (item === 'start') {
+        const startLabel = getStartMenuLabel();
         let startPx = compact ? 15 : 18;
         if (rowW < 260) startPx = 13;
         if (rowW < 200) startPx = 11;
         ctx.textAlign = 'center';
-        ctx.fillStyle = textColor;
+        ctx.fillStyle = menu.multiplayerMode ? (selected ? COL.amber : COL.amberPri) : textColor;
         for (;;) {
           ctx.font = startPx + 'px ' + FONT_MONO;
-          if (ctx.measureText('START GAME').width <= rowW - 16 || startPx <= 9) break;
+          if (ctx.measureText(startLabel).width <= rowW - 16 || startPx <= 9) break;
           startPx--;
         }
-        ctx.save(); if (selected) { ctx.shadowColor = COL.glowStrong; ctx.shadowBlur = 10; }
-        ctx.fillText('START GAME', cx, row.y + 7); ctx.restore();
+        ctx.save(); if (selected) { ctx.shadowColor = menu.multiplayerMode ? 'rgba(255,204,0,0.35)' : COL.glowStrong; ctx.shadowBlur = 10; }
+        ctx.fillText(startLabel, cx, row.y + 7); ctx.restore();
       } else if (isCat) {
         const catId = item.slice(4);
         const cat = CHEAT_CATEGORIES.find(c => c.id === catId);
@@ -2541,7 +3405,7 @@
         const onCount = cat.keys.filter(k => menu.cheats[k]).length;
         ctx.fillStyle = selected ? COL.bright : cc.pri;
         ctx.font = (rowW < 280 ? '11px ' : '13px ') + FONT_MONO; ctx.textAlign = 'left';
-        ctx.fillText(arrow + ' ' + cat.label, colL, row.y + 5);
+        ctx.fillText(arrow + ' ' + cat.label, labelX, row.y + 5);
         ctx.fillStyle = cc.dim; ctx.font = '9px ' + FONT_MONO;
         ctx.fillText(cat.keys.length + ' ITEMS', colMidL, row.y + 5);
         if (onCount > 0) {
@@ -2553,7 +3417,7 @@
         const def = UPGRADE_DEFS[key], on = menu.cheats[key];
         ctx.fillStyle = on ? (selected ? COL.bright : COL.primary) : (selected ? COL.dim : COL.shadow);
         ctx.font = '11px ' + FONT_MONO; ctx.textAlign = 'left';
-        const nameX = colL + (selected ? 10 : 0);
+        const nameX = labelX;
         let label = def.name;
         const maxNameW = rowW - rowPad * 2 - 36;
         while (label.length > 4 && ctx.measureText(label).width > maxNameW) label = label.slice(0, -2) + '\u2026';
@@ -2568,15 +3432,97 @@
         }
       } else if (item === 'name') {
         ctx.fillStyle = textColor; ctx.font = (rowW < 300 ? '12px ' : '14px ') + FONT_MONO; ctx.textAlign = 'left';
-        ctx.fillText('NAME:', colL, row.y + 6);
-        const nameVal = menu.playerName || (menu.nameActive ? '' : 'ANONYMOUS');
+        ctx.fillText('NAME:', labelX, row.y + 6);
+        const nameVal = menu.playerName || (menu.activeField === 'name' ? '' : 'ANONYMOUS');
         ctx.fillStyle = menu.playerName ? textColor : (selected ? COL.dim : COL.shadow);
-        const cursorChar = menu.nameActive && frameTick % 50 < 25 ? '\u2588' : '';
-        let base = menu.nameActive ? menu.playerName.toUpperCase() : nameVal;
-        const nameStartX = colL + ctx.measureText('NAME: ').width;
+        const cursorChar = menu.activeField === 'name' && frameTick % 50 < 25 ? '\u2588' : '';
+        let base = menu.activeField === 'name' ? menu.playerName.toUpperCase() : nameVal;
+        const nameStartX = labelX + ctx.measureText('NAME: ').width;
         const maxNm = colR - nameStartX;
         while (base.length > 0 && ctx.measureText(base + cursorChar).width > maxNm) base = base.slice(0, -1);
         ctx.fillText(base + cursorChar, nameStartX, row.y + 6);
+      } else if (item === 'mp_room') {
+        const roomLocked = multiplayer.active;
+        ctx.fillStyle = roomLocked ? COL.amberDim : textColor;
+        ctx.font = (rowW < 300 ? '12px ' : '14px ') + FONT_MONO; ctx.textAlign = 'left';
+        ctx.fillText('ROOM:', labelX, row.y + 6);
+        const roomVal = multiplayer.roomCode || (menu.activeField === 'mp_room' ? '' : 'AUTO');
+        ctx.fillStyle = roomLocked ? COL.amberDim : (multiplayer.roomCode ? (selected ? COL.amber : COL.amberPri) : COL.amberDim);
+        const cursorChar = menu.activeField === 'mp_room' && frameTick % 50 < 25 ? '\u2588' : '';
+        let base = menu.activeField === 'mp_room' ? multiplayer.roomCode : roomVal;
+        const startX = labelX + ctx.measureText('ROOM: ').width;
+        const maxVal = colR - startX;
+        while (base.length > 0 && ctx.measureText(base + cursorChar).width > maxVal) base = base.slice(0, -1);
+        ctx.fillText(base + cursorChar, startX, row.y + 6);
+      } else if (item === 'mp_host') {
+        const hostLocked = multiplayer.active;
+        ctx.fillStyle = hostLocked ? COL.amberDim : textColor;
+        ctx.font = (rowW < 300 ? '12px ' : '14px ') + FONT_MONO; ctx.textAlign = 'left';
+        ctx.fillText('HOST:', labelX, row.y + 6);
+        const hostVal = multiplayer.host || (menu.activeField === 'mp_host' ? '' : location.host);
+        ctx.fillStyle = hostLocked ? COL.amberDim : (selected ? COL.amber : COL.amberPri);
+        const cursorChar = menu.activeField === 'mp_host' && frameTick % 50 < 25 ? '\u2588' : '';
+        let base = menu.activeField === 'mp_host' ? (multiplayer.host || '') : hostVal;
+        const startX = labelX + ctx.measureText('HOST: ').width;
+        const maxVal = colR - startX;
+        while (base.length > 0 && ctx.measureText(base + cursorChar).width > maxVal) base = base.slice(0, -1);
+        ctx.fillText(base + cursorChar, startX, row.y + 6);
+      } else if (item === 'mp_matchmode') {
+        const modeLocked = isMatchModeLocked();
+        const liveMode = modeLocked && multiplayer.snapshot && multiplayer.snapshot.mode
+          ? multiplayer.snapshot.mode
+          : multiplayer.mode;
+        const modeLabel = liveMode === 'pvp' ? 'PVP' : 'CO-OP';
+        ctx.fillStyle = modeLocked ? COL.amberDim : textColor;
+        ctx.font = (rowW < 300 ? '12px ' : '14px ') + FONT_MONO; ctx.textAlign = 'left';
+        ctx.fillText('MATCH TYPE', labelX, row.y + 6);
+        if (modeLocked) {
+          ctx.fillStyle = COL.amberDim;
+        } else {
+          ctx.fillStyle = liveMode === 'pvp' ? COL.red : COL.amber;
+        }
+        ctx.font = 'bold 11px ' + FONT_MONO; ctx.textAlign = 'right';
+        ctx.fillText(modeLabel, colMidR, row.y + 4);
+      } else if (item === 'mp_join') {
+        const joinLocked = multiplayer.active;
+        ctx.fillStyle = joinLocked ? COL.amberDim : textColor;
+        ctx.font = (rowW < 300 ? '12px ' : '14px ') + FONT_MONO; ctx.textAlign = 'left';
+        ctx.fillText('JOIN ROOM', labelX, row.y + 6);
+        if (!joinLocked) {
+          ctx.fillStyle = multiplayer.roomCode ? COL.amberPri : COL.amberDim;
+          ctx.font = 'bold 10px ' + FONT_MONO; ctx.textAlign = 'right';
+          ctx.fillText(multiplayer.roomCode ? 'READY' : 'NEEDS CODE', colMidR, row.y + 5);
+        }
+      } else if (item === 'mp_leave') {
+        ctx.fillStyle = multiplayer.active ? textColor : COL.amberDim;
+        ctx.font = (rowW < 300 ? '12px ' : '14px ') + FONT_MONO; ctx.textAlign = 'left';
+        ctx.fillText('LEAVE LOBBY', labelX, row.y + 6);
+        ctx.fillStyle = multiplayer.active ? COL.amberPri : COL.amberDim;
+        ctx.font = 'bold 10px ' + FONT_MONO; ctx.textAlign = 'right';
+        ctx.fillText(multiplayer.active ? 'ACTIVE' : 'IDLE', colMidR, row.y + 5);
+      } else if (item === 'mp_status') {
+        const lines = getMultiplayerStatusDisplayLines();
+        ctx.strokeStyle = 'rgba(255, 204, 0, 0.2)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(rowX + 6, row.y - rowHalf + 2);
+        ctx.lineTo(rowX + rowW - 6, row.y - rowHalf + 2);
+        ctx.stroke();
+        ctx.fillStyle = COL.amberDim;
+        ctx.font = '10px ' + FONT_MONO;
+        ctx.textAlign = 'left';
+        for (let j = 0; j < lines.length; j++) {
+          ctx.fillText(lines[j], colL, row.y - rowHalf + 16 + j * 12);
+        }
+      } else if (item === 'crt') {
+        const status = menu.crtSupported ? (menu.crtEnabled ? 'ON' : 'OFF') : 'N/A';
+        const statusCol = !menu.crtSupported ? COL.shadow : (menu.crtEnabled ? COL.bright : COL.dim);
+        ctx.fillStyle = textColor; ctx.font = (rowW < 300 ? '12px ' : '14px ') + FONT_MONO; ctx.textAlign = 'left';
+        ctx.fillText('CRT SHADER', labelX, row.y + 6);
+        ctx.fillStyle = COL.shadow; ctx.font = '9px ' + FONT_MONO;
+        ctx.fillText(menu.crtSupported ? 'WEBGL POST FX' : 'WEBGL NOT SUPPORTED', colMidL, row.y + 5);
+        ctx.fillStyle = statusCol; ctx.font = 'bold 11px ' + FONT_MONO; ctx.textAlign = 'right';
+        ctx.fillText(status, colMidR, row.y + 4);
       }
     }
 
@@ -2612,7 +3558,7 @@
     // ends above that block (baselines minus ascent, plus a gap).
     const menuLbBottomReserve = compact ? padY + 34 + 12 + 10 : 50;
 
-    if (DREAMLO_PUBLIC) {
+    if (leaderboardApi.enabled) {
       const menuRight = (W + rowW) / 2;
       const sideSpace = W - menuRight - padX - 50;
       const isSide = sideSpace >= 120;
@@ -2714,13 +3660,14 @@
       ctx.fillText('TAP ROW TO SELECT', cx, footBase - 34);
       ctx.fillText('IN GAME: HOTBAR + DRAG TO DRAW / USE TOOLS', cx, footBase - 20);
     } else {
-      ctx.fillText('\u2191\u2193 NAVIGATE    ENTER SELECT    A/D MOVE    SPACE JUMP    SHIFT SPRINT    E DASH    ESC PAUSE', cx, footBase - 36);
+      ctx.fillText('\u2191\u2193 NAVIGATE    ENTER SELECT    A/D MOVE  2xA/D DASH    SPACE JUMP    SHIFT SPRINT    ESC PAUSE', cx, footBase - 36);
       ctx.fillText('1-9 TOOLS    SCROLL CYCLE    CLICK+DRAG PLATFORMS    HOLD JUMP TO GLIDE', cx, footBase - 22);
     }
     ctx.textAlign = 'left';
   }
 
-  // main loop
-  function loop() { update(); render(); requestAnimationFrame(loop); }
+  // main loop — simulation lives in the active Session (LocalSession or NetworkSession);
+  // this thread just keeps repainting whatever snapshot the session last published.
+  function loop() { render(); requestAnimationFrame(loop); }
   loadAssets(() => { loop(); });
 })();

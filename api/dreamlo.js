@@ -1,5 +1,5 @@
 /**
- * Same-origin proxy for dreamlo (http-only, no CORS).
+ * Same-origin proxy for dreamlo (no CORS from browser).
  * Query: ?path=PUBLIC_OR_PRIVATE_KEY/pipe | KEY/add/...
  *
  * Uses node:http instead of fetch — Undici fetch to plain HTTP often fails on Vercel (502 from catch).

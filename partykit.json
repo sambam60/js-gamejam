@@ -1,0 +1,6 @@
+{
+  "name": "shapescape",
+  "main": "party/server.ts",
+  "serve": "public",
+  "compatibilityDate": "2024-04-05"
+}
