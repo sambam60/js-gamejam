@@ -277,12 +277,14 @@
   initDOMWhenReady();
 
   function fireSwitchClick() {
-    if (!hapticCheckbox || !hapticLabel) {
+    if (!hapticCheckbox) {
       dbg('fire: no DOM');
       return;
     }
     const before = hapticCheckbox.checked;
-    try { hapticLabel.click(); } catch (_) {}
+    // Click the <input switch> directly. Clicking the parent <label> would
+    // ALSO forward to the input, so firing both cancels out (toggles twice,
+    // net zero) and iOS sees no state change — no haptic.
     try { hapticCheckbox.click(); } catch (_) {}
     dbg('fire: ' + before + '->' + hapticCheckbox.checked);
   }
