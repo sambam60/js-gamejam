@@ -3,12 +3,15 @@
 //   1. navigator.vibrate (Android, desktop Chrome on vibration-capable devices)
 //      Intensity is simulated via PWM of duration+delay segments.
 //   2. iOS 17.4+ <input type="checkbox" switch> trick. Toggling the switch
-//      element fires a subtle system haptic; we rAF-loop .click() calls at
-//      an interval derived from intensity (16ms @ 1.0 ... 200ms @ ~0) for the
-//      requested duration. Only used when navigator.vibrate is missing.
-// First click must happen synchronously inside a user-gesture callback
-// for iOS to actually produce haptic output; callers invoke haptics.trigger
-// from touchstart / click, so that works.
+//      element fires the Taptic Engine; we rAF-loop .click() calls at an
+//      interval derived from intensity (16ms @ 1.0 ... 200ms @ ~0) for the
+//      requested duration.
+// Critical constraints for the iOS path:
+//   - The switch element must already be in the DOM when trigger() runs
+//     (we create it eagerly, not lazily).
+//   - The first click must happen synchronously inside a user-gesture
+//     callback. Callers invoke haptics.trigger from touchstart / click, so
+//     that holds.
 (function () {
   'use strict';
 
@@ -41,8 +44,9 @@
     typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function';
 
   let enabled = true;
-  let instanceCounter = 0;
+  let showSwitch = false;
   let hapticLabel = null;
+  let hapticCheckbox = null;
   let domInitialized = false;
   let rafId = null;
 
@@ -73,8 +77,6 @@
     return null;
   }
 
-  // Apply PWM modulation of a single vibration to approximate intensity on
-  // the on/off-only Web Vibration API.
   function modulateVibration(duration, intensity) {
     if (intensity >= 1) return [duration];
     if (intensity <= 0) return [];
@@ -128,27 +130,70 @@
     return result;
   }
 
+  function applySwitchVisibility() {
+    if (!hapticLabel || !hapticCheckbox) return;
+    if (showSwitch) {
+      hapticLabel.style.display = '';
+      hapticCheckbox.style.display = '';
+    } else {
+      hapticLabel.style.display = 'none';
+      hapticCheckbox.style.display = 'none';
+    }
+  }
+
   function ensureDOM() {
-    if (domInitialized || typeof document === 'undefined' || !document.body) return;
-    const id = 'web-haptics-' + (++instanceCounter);
+    if (domInitialized) return;
+    if (typeof document === 'undefined' || !document.body) return;
+    const id = 'web-haptics-switch';
     const label = document.createElement('label');
     label.setAttribute('for', id);
-    label.setAttribute('aria-hidden', 'true');
-    label.style.cssText =
-      'position:fixed;bottom:-9999px;left:-9999px;width:0;height:0;' +
-      'pointer-events:none;opacity:0;overflow:hidden;';
+    label.textContent = 'Haptic feedback';
+    label.style.position = 'fixed';
+    label.style.bottom = '10px';
+    label.style.left = '10px';
+    label.style.padding = '5px 10px';
+    label.style.backgroundColor = 'rgba(0, 0, 0, 0.7)';
+    label.style.color = 'white';
+    label.style.fontFamily = 'sans-serif';
+    label.style.fontSize = '14px';
+    label.style.borderRadius = '4px';
+    label.style.zIndex = '9999';
+    label.style.userSelect = 'none';
+
     const cb = document.createElement('input');
     cb.type = 'checkbox';
-    // The `switch` attribute is the Apple-specific toggle that triggers the
-    // iOS 17.4+ system haptic when its checked state changes.
+    // Apple-specific toggle attribute — renders as iOS switch and fires the
+    // Taptic Engine on state change in Safari 17.4+.
     cb.setAttribute('switch', '');
     cb.id = id;
-    cb.tabIndex = -1;
-    cb.style.cssText = 'all:initial;appearance:auto;';
+    cb.style.all = 'initial';
+    cb.style.appearance = 'auto';
+
     label.appendChild(cb);
     document.body.appendChild(label);
     hapticLabel = label;
+    hapticCheckbox = cb;
     domInitialized = true;
+    applySwitchVisibility();
+  }
+
+  function initDOMWhenReady() {
+    if (typeof document === 'undefined') return;
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', ensureDOM, { once: true });
+    } else {
+      ensureDOM();
+    }
+  }
+  initDOMWhenReady();
+
+  function fireSwitchClick() {
+    if (!hapticCheckbox || !hapticLabel) return;
+    // Click the label (dispatches to associated input in most browsers) AND
+    // the input directly (some WebKit builds only fire Taptic on a direct
+    // click of the <input switch>, not via label forwarding).
+    try { hapticLabel.click(); } catch (_) {}
+    try { hapticCheckbox.click(); } catch (_) {}
   }
 
   function stopPattern() {
@@ -192,9 +237,9 @@
         const toggleInterval = TOGGLE_MIN + (1 - phase.intensity) * TOGGLE_MAX;
         if (lastToggle === -1) {
           lastToggle = time;
-          if (!didFirst) { hapticLabel.click(); didFirst = true; }
+          if (!didFirst) { fireSwitchClick(); didFirst = true; }
         } else if (time - lastToggle >= toggleInterval) {
-          hapticLabel.click();
+          fireSwitchClick();
           lastToggle = time;
         }
       }
@@ -230,8 +275,7 @@
     const firstDelay = vibrations[0].delay || 0;
     let firstClickFired = false;
     if (firstDelay === 0) {
-      // Must run inside the user-gesture callback for iOS to produce haptics.
-      hapticLabel.click();
+      fireSwitchClick();
       firstClickFired = true;
     }
     runSwitchPattern(vibrations, defaultIntensity, firstClickFired);
@@ -247,9 +291,10 @@
   window.haptics = {
     trigger,
     stop,
-    isSupported: () => canVibrate || (typeof document !== 'undefined'),
+    isSupported: () => canVibrate || typeof document !== 'undefined',
     setEnabled: v => { enabled = !!v; if (!v) stop(); },
     isEnabled: () => enabled,
+    setShowSwitch: v => { showSwitch = !!v; applySwitchVisibility(); },
     patterns: DEFAULT_PATTERNS,
   };
 })();
