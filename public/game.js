@@ -1733,20 +1733,10 @@
   function mobileBtn(btn, onDown, onUp, hapticPreset) {
     if (!btn) return;
     const preset = hapticPreset || 'selection';
-    let touched = false;
-    btn.addEventListener('touchstart', () => {
-      touched = true;
-      haptic(preset);
-      onDown();
-    }, { passive: true });
+    btn.addEventListener('touchstart', onDown, { passive: true });
     btn.addEventListener('touchend', onUp, { passive: true });
     btn.addEventListener('touchcancel', onUp, { passive: true });
     btn.addEventListener('click', e => {
-      if (touched) {
-        touched = false;
-        e.preventDefault();
-        return;
-      }
       e.preventDefault();
       haptic(preset);
     });
@@ -1769,17 +1759,10 @@
   function mobileTap(btn, handler, hapticPreset) {
     if (!btn) return;
     const preset = hapticPreset || 'light';
-    let touched = false;
-    btn.addEventListener('touchstart', () => {
-      touched = true;
-      haptic(preset);
-    }, { passive: true });
     const run = e => {
-      if (touched) {
-        touched = false;
-      }
       if (e.type === 'click' && e.detail === 0) return;
       e.preventDefault();
+      haptic(preset);
       handler();
     };
     btn.addEventListener('click', run);
