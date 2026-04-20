@@ -177,6 +177,8 @@ canvas {
   cursor: pointer;
   -webkit-user-select: none;
   user-select: none;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 
 #hotbar .slot.selected {

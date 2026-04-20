@@ -1560,19 +1560,13 @@
         slot.className = 'slot';
         slot.dataset.idx = i;
         slot.innerHTML = '<span class="slot-num">' + (i + 1) + '</span><span class="slot-icon">' + (def ? def.icon : '') + '</span><div class="slot-cd"></div>';
-        slot.addEventListener('mousedown', e => {
-          e.stopPropagation();
+        slot.addEventListener('click', e => {
+          e.preventDefault(); e.stopPropagation();
+          haptic('selection');
           const idx = parseInt(slot.dataset.idx);
           state.selectedSlot = idx;
           if (sessionActive() && state.inventory[idx]) sessionSend({ type: 'selectTool', tool: state.inventory[idx] });
         });
-        slot.addEventListener('touchstart', e => {
-          e.preventDefault(); e.stopPropagation();
-          if (window.haptics) window.haptics.trigger('selection');
-          const idx = parseInt(slot.dataset.idx);
-          state.selectedSlot = idx;
-          if (sessionActive() && state.inventory[idx]) sessionSend({ type: 'selectTool', tool: state.inventory[idx] });
-        }, { passive: false });
         hotbarEl.appendChild(slot);
       }
       // text label showing which tool is selected
@@ -1733,23 +1727,24 @@
   }
 
   function haptic(preset) {
-    try {
-      if (location && /(?:^|[?&])haptic-debug=1\b/.test(location.search || '')) {
-        console.log('[game] haptic(', preset, ')');
-      }
-    } catch (_) {}
     if (window.haptics && window.haptics.trigger) window.haptics.trigger(preset);
   }
 
   function mobileBtn(btn, onDown, onUp, hapticPreset) {
     if (!btn) return;
     const preset = hapticPreset || 'selection';
-    btn.addEventListener('touchstart', e => { e.preventDefault(); haptic(preset); onDown(); }, { passive: false });
-    btn.addEventListener('touchend', e => { e.preventDefault(); onUp(); }, { passive: false });
-    btn.addEventListener('touchcancel', e => { e.preventDefault(); onUp(); }, { passive: false });
-    btn.addEventListener('mousedown', onDown);
-    btn.addEventListener('mouseup', onUp);
-    btn.addEventListener('mouseleave', onUp);
+    btn.addEventListener('touchstart', onDown, { passive: true });
+    btn.addEventListener('touchend', onUp, { passive: true });
+    btn.addEventListener('touchcancel', onUp, { passive: true });
+    btn.addEventListener('click', e => {
+      e.preventDefault();
+      haptic(preset);
+    });
+    if (!window.matchMedia('(pointer: coarse)').matches) {
+      btn.addEventListener('mousedown', onDown);
+      btn.addEventListener('mouseup', onUp);
+      btn.addEventListener('mouseleave', onUp);
+    }
   }
 
   function mobileBtnPlaying(btn, onDown, onUp, hapticPreset) {
@@ -1765,11 +1760,11 @@
     if (!btn) return;
     const preset = hapticPreset || 'light';
     const run = e => {
-      if (e.type === 'mousedown' && e.button !== 0) return;
+      if (e.type === 'click' && e.detail === 0) return;
       e.preventDefault();
+      haptic(preset);
       handler();
     };
-    btn.addEventListener('touchstart', e => { e.preventDefault(); haptic(preset); handler(); }, { passive: false });
     btn.addEventListener('click', run);
   }
 
