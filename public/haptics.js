@@ -276,17 +276,30 @@
   }
   initDOMWhenReady();
 
+  // iOS Safari fires the Taptic Engine on the FIRST state change of a fresh
+  // <input type="checkbox" switch>, but debounces/suppresses repeat toggles
+  // on a persistent one. Mirror the tijnjh/ios-haptics approach: build a
+  // throwaway element, click the label (which forwards to the input once),
+  // then remove it.
   function fireSwitchClick() {
-    if (!hapticCheckbox) {
-      dbg('fire: no DOM');
-      return;
+    if (typeof document === 'undefined') { dbg('fire: no doc'); return; }
+    const parent = document.head || document.body;
+    if (!parent) { dbg('fire: no parent'); return; }
+    try {
+      const label = document.createElement('label');
+      label.setAttribute('aria-hidden', 'true');
+      label.style.display = 'none';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.setAttribute('switch', '');
+      label.appendChild(cb);
+      parent.appendChild(label);
+      label.click();
+      parent.removeChild(label);
+      dbg('fire: fresh ok');
+    } catch (e) {
+      dbg('fire: err ' + (e && e.message || ''));
     }
-    const before = hapticCheckbox.checked;
-    // Click the <input switch> directly. Clicking the parent <label> would
-    // ALSO forward to the input, so firing both cancels out (toggles twice,
-    // net zero) and iOS sees no state change — no haptic.
-    try { hapticCheckbox.click(); } catch (_) {}
-    dbg('fire: ' + before + '->' + hapticCheckbox.checked);
   }
 
   function stopPattern() {
