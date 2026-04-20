@@ -1733,6 +1733,11 @@
   }
 
   function haptic(preset) {
+    try {
+      if (location && /(?:^|[?&])haptic-debug=1\b/.test(location.search || '')) {
+        console.log('[game] haptic(', preset, ')');
+      }
+    } catch (_) {}
     if (window.haptics && window.haptics.trigger) window.haptics.trigger(preset);
   }
 

@@ -50,6 +50,7 @@
   let domInitialized = false;
   let rafId = null;
   let debugPanel = null;
+  let debugLogEl = null;
 
   const debugFromURL = (() => {
     try {
@@ -58,6 +59,23 @@
     } catch (_) { return false; }
   })();
   if (debugFromURL) showSwitch = true;
+
+  function dbg(msg) {
+    if (!debugFromURL) return;
+    if (!debugLogEl) {
+      if (typeof document === 'undefined' || !document.body) return;
+      debugLogEl = document.createElement('div');
+      debugLogEl.id = 'haptic-debug-log';
+      debugLogEl.style.cssText =
+        'position:fixed;top:50%;left:8px;transform:translateY(-50%);' +
+        'z-index:100001;max-width:180px;max-height:60vh;overflow:hidden;' +
+        'background:rgba(0,0,0,0.85);color:#0f0;font:10px/1.3 monospace;' +
+        'padding:6px;border-radius:4px;pointer-events:none;white-space:pre-wrap;';
+      document.body.appendChild(debugLogEl);
+    }
+    const line = new Date().toISOString().slice(14, 19) + ' ' + msg;
+    debugLogEl.textContent = (line + '\n' + debugLogEl.textContent).slice(0, 1500);
+  }
 
   function normalizeInput(input) {
     if (typeof input === 'number') return [{ duration: input }];
@@ -259,12 +277,14 @@
   initDOMWhenReady();
 
   function fireSwitchClick() {
-    if (!hapticCheckbox || !hapticLabel) return;
-    // Click the label (dispatches to associated input in most browsers) AND
-    // the input directly (some WebKit builds only fire Taptic on a direct
-    // click of the <input switch>, not via label forwarding).
+    if (!hapticCheckbox || !hapticLabel) {
+      dbg('fire: no DOM');
+      return;
+    }
+    const before = hapticCheckbox.checked;
     try { hapticLabel.click(); } catch (_) {}
     try { hapticCheckbox.click(); } catch (_) {}
+    dbg('fire: ' + before + '->' + hapticCheckbox.checked);
   }
 
   function stopPattern() {
@@ -320,9 +340,10 @@
   }
 
   function trigger(input, options) {
-    if (!enabled) return;
+    dbg('trigger(' + (typeof input === 'string' ? input : '?') + ')');
+    if (!enabled) { dbg('  disabled'); return; }
     const vibrations = normalizeInput(input);
-    if (!vibrations || vibrations.length === 0) return;
+    if (!vibrations || vibrations.length === 0) { dbg('  no vibs'); return; }
     const defaultIntensity = Math.max(
       0,
       Math.min(1, (options && options.intensity) != null ? options.intensity : DEFAULT_INTENSITY)
